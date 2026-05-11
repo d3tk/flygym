@@ -7,6 +7,17 @@
     * [1bis. Advanced model composition](tutorials/1bis_advanced_model_composition.ipynb)
     * [2. Replaying experimental recordings](tutorials/2_replaying_experimental_recordings.ipynb)
     * [3. GPU-accelerated simulation](tutorials/3_gpu_accelerated_simulation.ipynb)
+    * [4. Simulation loops and kinematic replay](tutorials/4_simulation_loops_and_kinematic_replay.ipynb)
+    * [5. Controlling locomotion with CPGs](tutorials/5_cpg_controller.ipynb)
+    * [6. Rule-based controller](tutorials/6_rule_based_controller.ipynb)
+    * [7. Hybrid controller](tutorials/7_hybrid_controller.ipynb)
+    * [8. Turning controller](tutorials/8_turning_controller.ipynb)
+    * [9. Olfaction basics](tutorials/9_olfaction_basics.ipynb)
+    * [10. Advanced olfaction](tutorials/10_advanced_olfaction.ipynb)
+    * [11. Vision basics](tutorials/11_vision_basics.ipynb)
+    * [12. Head stabilization](tutorials/12_head_stabilization.ipynb)
+    * [13. Path integration](tutorials/13_path_integration.ipynb)
+    * [14. Advanced vision](tutorials/14_advanced_vision.ipynb)
 * API Reference
     * [anatomy](api_reference/flygym/anatomy.md)
     * compose

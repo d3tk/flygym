@@ -70,6 +70,22 @@ dev = [
 examples = [
     "ipykernel>=7.1.0",
     "ipython>=9.10,<10.0",
+    "scipy>=1.0,<2.0",
+    "tqdm>=4.0,<5.0",
+    "networkx>=3.0,<4.0",
+    "opencv-python>=4.0,<5.0",
+    "joblib>=1.0,<2.0",
+    "scikit-learn>=1.0,<2.0",
+    "seaborn==0.13.*",
+    "torch>=2.0,<3.0",
+    "lightning>=2.0,<3.0",
+    "tensorboardX>=2.0,<3.0",
+    "phiflow>=3.3.0,<4.0",
+    "phiml>=1.12.0,<2.0",
+    "h5py>=3.0,<4.0",
+    "flyvis==1.1.2",
+    "cachetools>=7,<8",
+    "numba>=0.60,<1.0",
     "pandas>=3.0,<4.0",
 ]
 
@@ -99,4 +115,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 flygym = ["assets/**"]
-flygym_demo = ["spotlight_data/assets/**"]
+flygym_demo = ["spotlight_data/assets/**", "examples/assets/**"]
