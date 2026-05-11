@@ -32,15 +32,24 @@ def make_walking_fly(
     *,
     axis_order: AxisOrder = AxisOrder.YAW_PITCH_ROLL,
     actuator_kp: float = 50.0,
-    adhesion_gain: float = 1.0,
+    adhesion_gain: float = 20.0,
     add_camera: bool = True,
+    colorize: bool = True,
 ) -> Fly:
-    """Create the standard 42-DoF walking fly used by tutorial controllers."""
+    """Create the standard 42-DoF walking fly used by tutorial controllers.
+
+    The helper intentionally mirrors the FlyGym v1 tutorial setup: the fly uses the
+    leg-only skeleton with active-leg position actuators, v1-like adhesion gain, a
+    tracking camera by default, and colored visual materials unless explicitly opted
+    out with ``colorize=False``.
+    """
 
     neutral_pose = KinematicPosePreset.NEUTRAL.get_pose_by_axis_order(axis_order)
     skeleton = Skeleton(axis_order=axis_order, joint_preset=JointPreset.LEGS_ONLY)
     fly = Fly(name=name)
     fly.add_joints(skeleton, neutral_pose=neutral_pose)
+    if colorize:
+        fly.colorize()
     actuated_dofs = skeleton.get_actuated_dofs_from_preset(
         ActuatedDOFPreset.LEGS_ACTIVE_ONLY
     )
@@ -56,6 +65,28 @@ def make_walking_fly(
     return fly
 
 
+def get_neutral_position_targets(
+    fly: Fly,
+    actuator_type: ActuatorType = ActuatorType.POSITION,
+) -> Float[np.ndarray, "n_position_actuators"]:
+    """Return neutral actuator inputs in actuator order.
+
+    ``Simulation.get_joint_angles()`` returns every joint DoF in skeleton order (66
+    values for the leg-only walking model), which is not a valid control vector for
+    the 42 active position actuators. This helper instead reads each actuator's
+    neutral input from the fly model in ``fly.get_actuated_jointdofs_order()`` order.
+    """
+
+    actuator_type = ActuatorType(actuator_type)
+    return np.asarray(
+        [
+            fly.jointdof_to_neutralaction_by_type[actuator_type][jointdof]
+            for jointdof in fly.get_actuated_jointdofs_order(actuator_type)
+        ],
+        dtype=np.float32,
+    )
+
+
 def apply_controller_output(
     sim: Simulation,
     fly_name: str,
@@ -65,6 +96,42 @@ def apply_controller_output(
 ) -> None:
     sim.set_actuator_inputs(fly_name, actuator_type, output.position_targets)
     sim.set_leg_adhesion_states(fly_name, output.adhesion.astype(np.float32))
+
+
+def settle_simulation(
+    sim: Simulation,
+    controller: StepController | None = None,
+    duration_s: float = 0.05,
+    fly_name: str | None = None,
+    render: bool = False,
+) -> None:
+    """Settle a simulation with valid actuator-order controls.
+
+    This controlled pre-roll replaces raw ``sim.warmup()`` in tutorial demos. If a
+    controller is supplied, its outputs are applied during settling. Otherwise each
+    fly receives its neutral position-actuator targets and all adhesion actuators are
+    held enabled. No records are returned, so callers naturally discard warmup data.
+    """
+
+    if duration_s <= 0:
+        return
+    if fly_name is None:
+        fly_name = next(iter(sim.world.fly_lookup))
+    fly = sim.world.fly_lookup[fly_name]
+    neutral_targets = get_neutral_position_targets(fly, ActuatorType.POSITION)
+    n_steps = int(round(duration_s / sim.timestep))
+    for _ in range(n_steps):
+        if hasattr(sim.world, "step"):
+            sim.world.step(sim, sim.timestep)  # type: ignore[misc]
+        if controller is None:
+            sim.set_actuator_inputs(fly_name, ActuatorType.POSITION, neutral_targets)
+            sim.set_leg_adhesion_states(fly_name, np.ones(6, dtype=np.float32))
+        else:
+            output = controller.step(sim)
+            apply_controller_output(sim, fly_name, output)
+        sim.step()
+        if render and sim.renderer is not None:
+            sim.render_as_needed()
 
 
 def run_closed_loop(
@@ -79,7 +146,9 @@ def run_closed_loop(
 ) -> list[dict[str, Any]]:
     """Run a v2 direct-control simulation loop.
 
-    The world may optionally expose ``reset(sim)`` and ``step(sim, dt)`` hooks.
+    The world may optionally expose ``reset(sim)`` and ``step(sim, dt)`` hooks. Any
+    warmup is performed through ``settle_simulation`` and discarded from returned
+    records.
     """
 
     if fly_name is None:
@@ -88,9 +157,15 @@ def run_closed_loop(
     sim.reset()
     if hasattr(sim.world, "reset"):
         sim.world.reset(sim)  # type: ignore[misc]
-    if warmup_s > 0:
-        sim.warmup(warmup_s)
     controller.reset()
+    if warmup_s > 0:
+        settle_simulation(
+            sim,
+            controller=controller,
+            duration_s=warmup_s,
+            fly_name=fly_name,
+            render=render,
+        )
 
     records: list[dict[str, Any]] = []
     n_steps = int(round(duration_s / sim.timestep))
