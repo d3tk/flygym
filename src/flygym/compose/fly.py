@@ -33,6 +33,7 @@ DEFAULT_RIGGING_CONFIG_PATH = assets_dir / "model/rigging.yaml"
 DEFAULT_MUJOCO_GLOBALS_PATH = assets_dir / "model/mujoco_globals.yaml"
 DEFAULT_MESH_DIR = assets_dir / "model/meshes/"
 DEFAULT_VISUALS_CONFIG_PATH = assets_dir / "model/visuals.yaml"
+DEFAULT_OLFACTION_CONFIG_PATH = assets_dir / "model/olfaction.yaml"
 
 
 class MeshType(Enum):
@@ -126,6 +127,8 @@ class Fly(BaseCompositionElement):
             Maps sensor names to MJCF sensor elements.
         cameraname_to_mjcfcamera:
             Maps camera names to MJCF camera elements.
+        olfactionsensorname_to_mjcfsite:
+            Maps olfactory sensor names to MJCF site elements.
         jointdof_to_neutralangle:
             Neutral (resting) angle for each joint DOF.
         jointdof_to_neutralaction_by_type:
@@ -162,6 +165,7 @@ class Fly(BaseCompositionElement):
         self.sensorname_to_mjcfsensor = {}
         self.cameraname_to_mjcfcamera = {}
         self.eyecameraname_to_mjcfcamera = {}
+        self.olfactionsensorname_to_mjcfsite = {}
         self.hidden_geoms = []
 
         self.jointdof_to_neutralangle = {}
@@ -479,6 +483,43 @@ class Fly(BaseCompositionElement):
 
         for segment_name in info["hidden_segments"]:
             self.hidden_geoms.append(self.mjcf_root.find("geom", segment_name))
+
+    def add_olfaction(
+        self,
+        draw_sensor_markers: bool = False,
+        config_path: PathLike = DEFAULT_OLFACTION_CONFIG_PATH,
+    ) -> dict[str, mjcf.Element]:
+        """Add olfactory receptor sites to the antennae and maxillary palps."""
+        if self.olfactionsensorname_to_mjcfsite:
+            raise ValueError("Olfaction sensors have already been added.")
+
+        with open(config_path) as f:
+            info = yaml.safe_load(f)
+
+        sensors = {}
+        for sensor_name, sensor_info in info["sensors"].items():
+            parent_body = self.mjcf_root.find("body", sensor_info["parent"])
+            sensor_body = parent_body.add(
+                "body",
+                name=f"{sensor_name}_body",
+                pos=sensor_info["rel_pos"],
+            )
+            site = sensor_body.add("site", name=sensor_name, pos=(0, 0, 0))
+            sensors[sensor_name] = site
+            if draw_sensor_markers:
+                sensor_body.add(
+                    "geom",
+                    name=f"{sensor_name}_marker",
+                    type="sphere",
+                    size=[0.06],
+                    rgba=sensor_info["marker_rgba"],
+                    mass=0,
+                    contype=0,
+                    conaffinity=0,
+                )
+
+        self.olfactionsensorname_to_mjcfsite.update(sensors)
+        return sensors
 
     def colorize(
         self, visuals_config_path: PathLike = DEFAULT_VISUALS_CONFIG_PATH

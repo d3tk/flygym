@@ -5,6 +5,8 @@ from .world import (
     FlatGroundWorld,
     GappedTerrainWorld,
     MixedTerrainWorld,
+    OdorPlumeWorld,
+    OdorWorld,
     TetheredWorld,
 )
 from .pose import KinematicPose, KinematicPosePreset
@@ -20,6 +22,8 @@ __all__ = [
     "GappedTerrainWorld",
     "BlocksTerrainWorld",
     "MixedTerrainWorld",
+    "OdorWorld",
+    "OdorPlumeWorld",
     "TetheredWorld",
     "KinematicPose",
     "KinematicPosePreset",

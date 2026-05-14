@@ -52,6 +52,7 @@ class Simulation:
         self._map_internal_jointids()
         self._map_internal_groundcontactsensor_ids()
         self._map_internal_site_ids()
+        self._map_internal_olfaction_sensor_site_ids()
         self._map_internal_eye_camera_ids()
         self._map_internal_hidden_geom_ids()
 
@@ -319,6 +320,25 @@ class Simulation:
         """
         internal_ids = self._internal_siteids_by_fly[fly_name]
         return self.mj_data.site_xpos[internal_ids, :]
+
+    def get_olfaction_sensor_positions(
+        self, fly_name: str
+    ) -> np.ndarray:
+        """Get global positions of olfactory sensor sites."""
+        internal_ids = self._internal_olfaction_siteids_by_fly.get(fly_name)
+        if internal_ids is None or len(internal_ids) == 0:
+            raise ValueError(
+                f"Fly '{fly_name}' does not have olfaction sensors defined. "
+                "Make sure to call fly.add_olfaction() when constructing the fly."
+            )
+        return self.mj_data.site_xpos[internal_ids, :]
+
+    def get_odor_intensity(
+        self, fly_name: str
+    ) -> np.ndarray:
+        """Get odor intensity at the fly's olfactory sensor sites."""
+        sensor_positions = self.get_olfaction_sensor_positions(fly_name)
+        return self.world.get_olfaction(sensor_positions, time=self.time)
 
     def set_actuator_inputs(
         self,
@@ -592,6 +612,22 @@ class Simulation:
                 internal_siteids_by_fly[fly_name].append(internal_site_id)
 
         self._internal_siteids_by_fly = {
+            k: np.array(v, dtype=np.int32) for k, v in internal_siteids_by_fly.items()
+        }
+
+    def _map_internal_olfaction_sensor_site_ids(self) -> None:
+        internal_siteids_by_fly = defaultdict(list)
+
+        for fly_name, fly in self.world.fly_lookup.items():
+            for sensor_site in fly.olfactionsensorname_to_mjcfsite.values():
+                internal_site_id = mj.mj_name2id(
+                    self.mj_model,
+                    mj.mjtObj.mjOBJ_SITE,
+                    sensor_site.full_identifier,
+                )
+                internal_siteids_by_fly[fly_name].append(internal_site_id)
+
+        self._internal_olfaction_siteids_by_fly = {
             k: np.array(v, dtype=np.int32) for k, v in internal_siteids_by_fly.items()
         }
 

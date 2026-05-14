@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from collections import defaultdict
+from os import PathLike
 from typing import Any, override
 
 import mujoco as mj
@@ -19,11 +21,28 @@ __all__ = [
     "GappedTerrainWorld",
     "BlocksTerrainWorld",
     "MixedTerrainWorld",
+    "OdorPlumeWorld",
+    "OdorWorld",
     "TetheredWorld",
 ]
 
 
 _STATE_DIM_BY_JOINT_TYPE = {"free": 7, "ball": 4, "hinge": 1, "slide": 1}
+_DEFAULT_COLOR_CYCLE_RGB = np.array(
+    [
+        [31, 119, 180],
+        [255, 127, 14],
+        [44, 160, 44],
+        [214, 39, 40],
+        [148, 103, 189],
+        [140, 86, 75],
+        [227, 119, 194],
+        [127, 127, 127],
+        [188, 189, 34],
+        [23, 190, 207],
+    ],
+    dtype=float,
+)
 
 
 class BaseWorld(BaseCompositionElement, ABC):
@@ -168,6 +187,20 @@ class BaseWorld(BaseCompositionElement, ABC):
         self.world_dof_neutral_states[freejoint.full_identifier] = neutral_state
 
         self._rebuild_neutral_keyframe()
+
+    @property
+    def odor_dimensions(self) -> int:
+        """Dimension of the odor signal provided by this world."""
+        return 0
+
+    def get_olfaction(
+        self,
+        sensor_positions: np.ndarray,
+        *,
+        time: float | None = None,
+    ) -> np.ndarray:
+        """Get odor intensity at olfactory sensor positions."""
+        return np.zeros((self.odor_dimensions, sensor_positions.shape[0]))
 
     def _rebuild_neutral_keyframe(self):
         mj_model, _ = self.compile()
@@ -356,6 +389,182 @@ class FlatGroundWorld(BaseWorld):
                 name=f"ground_contact_{leg}_leg",
             )
             self.legpos_to_groundcontactsensors_by_fly[fly.name][leg] = sensor
+
+
+def _inverse_square(distance: np.ndarray) -> np.ndarray:
+    return distance**-2
+
+
+class OdorWorld(FlatGroundWorld):
+    """Flat world with static odor sources."""
+
+    def __init__(
+        self,
+        name: str = "odor_world",
+        *,
+        half_size: float = 1000,
+        odor_source: np.ndarray | None = None,
+        peak_odor_intensity: np.ndarray | None = None,
+        diffuse_func: Callable[[np.ndarray], np.ndarray] = _inverse_square,
+        marker_colors: np.ndarray | None = None,
+        marker_size: float = 0.25,
+    ) -> None:
+        super().__init__(name=name, half_size=half_size)
+
+        if odor_source is None:
+            odor_source = np.array([[10, 0, 0]], dtype=float)
+        else:
+            odor_source = np.asarray(odor_source, dtype=float)
+        if peak_odor_intensity is None:
+            peak_odor_intensity = np.array([[1]], dtype=float)
+        else:
+            peak_odor_intensity = np.asarray(peak_odor_intensity, dtype=float)
+
+        if odor_source.ndim != 2 or odor_source.shape[1] != 3:
+            raise ValueError("odor_source must have shape (n_sources, 3).")
+        if peak_odor_intensity.ndim != 2:
+            raise ValueError(
+                "peak_odor_intensity must have shape "
+                "(n_sources, odor_dimensions)."
+            )
+        if odor_source.shape[0] != peak_odor_intensity.shape[0]:
+            raise ValueError(
+                "Number of odor source locations and peak intensities must match."
+            )
+
+        self.odor_source = odor_source
+        self.peak_odor_intensity = peak_odor_intensity
+        self.diffuse_func = diffuse_func
+        self.num_odor_sources = odor_source.shape[0]
+
+        if marker_colors is None:
+            color_idx = np.arange(self.num_odor_sources) % len(_DEFAULT_COLOR_CYCLE_RGB)
+            marker_colors = np.column_stack(
+                (_DEFAULT_COLOR_CYCLE_RGB[color_idx] / 255, np.ones(self.num_odor_sources))
+            )
+        marker_colors = np.asarray(marker_colors, dtype=float)
+        if marker_colors.shape != (self.num_odor_sources, 4):
+            raise ValueError("marker_colors must have shape (n_sources, 4).")
+
+        for idx, (pos, rgba) in enumerate(zip(self.odor_source, marker_colors)):
+            marker_body = self.mjcf_root.worldbody.add(
+                "body",
+                name=f"odor_source_marker_{idx}",
+                pos=pos,
+                mocap=True,
+            )
+            marker_body.add(
+                "geom",
+                type="capsule",
+                size=(marker_size, marker_size),
+                rgba=rgba,
+                contype=0,
+                conaffinity=0,
+            )
+
+    @override
+    def get_olfaction(
+        self,
+        sensor_positions: np.ndarray,
+        *,
+        time: float | None = None,
+    ) -> np.ndarray:
+        n_sensors = sensor_positions.shape[0]
+        odor_sources = np.repeat(
+            np.repeat(
+                self.odor_source[:, np.newaxis, np.newaxis, :],
+                self.odor_dimensions,
+                axis=1,
+            ),
+            n_sensors,
+            axis=2,
+        )
+        peak_intensity = np.repeat(
+            self.peak_odor_intensity[:, :, np.newaxis],
+            n_sensors,
+            axis=2,
+        )
+        sensor_positions = sensor_positions[np.newaxis, np.newaxis, :, :]
+        distance = np.linalg.norm(sensor_positions - odor_sources, axis=3)
+        return (peak_intensity * self.diffuse_func(distance)).sum(axis=0)
+
+    @property
+    @override
+    def odor_dimensions(self) -> int:
+        return self.peak_odor_intensity.shape[1]
+
+
+class OdorPlumeWorld(FlatGroundWorld):
+    """Flat world backed by a time-varying HDF5 odor plume."""
+
+    def __init__(
+        self,
+        plume_data_path: str | PathLike,
+        main_camera_name: str = "",
+        *,
+        name: str = "odor_plume_world",
+        dimension_scale_factor: float = 0.5,
+        plume_simulation_fps: float = 200,
+        intensity_scale_factor: float = 1.0,
+        friction: tuple[float, float, float] = (1, 0.005, 0.0001),
+        num_sensors: int = 4,
+    ) -> None:
+        import h5py
+
+        self.plume_dataset = h5py.File(plume_data_path, "r")
+        self.plume_grid = self.plume_dataset["plume"]
+        self.arena_size = (
+            np.array(self.plume_grid.shape[1:][::-1]) * dimension_scale_factor
+        )
+        self.dimension_scale_factor = dimension_scale_factor
+        self.plume_simulation_fps = plume_simulation_fps
+        self.intensity_scale_factor = intensity_scale_factor
+        self.num_sensors = num_sensors
+        self.main_camera_name = main_camera_name
+        self.plume_update_interval = 1 / plume_simulation_fps
+
+        super().__init__(name=name, half_size=float(np.max(self.arena_size)) * 2)
+        self.ground_geom.friction = friction
+
+    @override
+    def get_olfaction(
+        self,
+        sensor_positions: np.ndarray,
+        *,
+        time: float | None = None,
+    ) -> np.ndarray:
+        if sensor_positions.shape[0] != self.num_sensors:
+            raise ValueError(
+                f"Expected {self.num_sensors} olfactory sensors, "
+                f"got {sensor_positions.shape[0]}."
+            )
+        if time is None:
+            time = 0.0
+        frame_num = int(time * self.plume_simulation_fps)
+        intensities = np.zeros((self.odor_dimensions, self.num_sensors))
+
+        for i_sensor, (x_mm, y_mm, _) in enumerate(sensor_positions):
+            x_idx = int(x_mm / self.dimension_scale_factor)
+            y_idx = int(y_mm / self.dimension_scale_factor)
+            if (
+                x_idx < 0
+                or y_idx < 0
+                or x_idx >= self.plume_grid.shape[2]
+                or y_idx >= self.plume_grid.shape[1]
+            ):
+                intensities[0, i_sensor] = np.nan
+            else:
+                intensities[0, i_sensor] = self.plume_grid[frame_num, y_idx, x_idx]
+
+        return intensities * self.intensity_scale_factor
+
+    @property
+    @override
+    def odor_dimensions(self) -> int:
+        return 1
+
+    def close(self) -> None:
+        self.plume_dataset.close()
 
 
 class _ComplexTerrainWorld(FlatGroundWorld):
