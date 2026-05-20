@@ -68,6 +68,7 @@ dev = [
     "rtree>=1.0,<2.0",
     # Git pre-commit filter: strips output from ipynb notebooks
     "nbstripout==0.9.0",
+    "rasterio>=1.5.0",
 ]
 examples = [
     "ipykernel>=7.1.0",
@@ -109,4 +110,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 flygym = ["assets/**"]
-flygym_demo = ["spotlight_data/assets/**"]
+flygym_demo = ["spotlight_data/assets/**", "complex_terrain/assets/**"]

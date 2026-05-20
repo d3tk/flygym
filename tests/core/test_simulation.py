@@ -16,11 +16,9 @@ from flygym.anatomy import (
 )
 from flygym.compose.fly import Fly, ActuatorType
 from flygym.compose.world import TetheredWorld, FlatGroundWorld
-from flygym.compose.pose import KinematicPose
 from flygym.compose.physics import ContactParams
 from flygym.utils.math import Rotation3D
 from flygym.simulation import Simulation
-import flygym
 
 
 # ==============================================================================
@@ -315,16 +313,25 @@ class TestGroundContactInfo:
 
     def test_returns_six_tuples(self, flat_sim, fly_with_joints):
         flat_sim.reset()
-        contact_active, forces, torques, positions, normals, tangents = (
+        contact_found, forces, torques, positions, normals, tangents = (
             flat_sim.get_ground_contact_info(fly_with_joints.name)
         )
-        assert len(contact_active) == 6
-        assert set(contact_active).issubset({0.0, 1.0})
+        assert len(contact_found) == 6
+        assert np.all(contact_found >= 0)
         assert forces.shape == (6, 3)
         assert torques.shape == (6, 3)
         assert positions.shape == (6, 3)
         assert normals.shape == (6, 3)
         assert tangents.shape == (6, 3)
+
+    def test_bodysegment_contact_forces_shape(self, flat_sim, fly_with_joints):
+        flat_sim.reset()
+        forces = flat_sim.get_bodysegment_contact_forces(
+            fly_with_joints.name,
+            [BodySegment("lf_tarsus5"), "rf_tarsus5"],
+        )
+        assert forces.shape == (2, 3)
+        assert np.all(np.isfinite(forces))
 
 
 # ==============================================================================
@@ -391,6 +398,43 @@ class TestProfilingMethods:
         captured = capsys.readouterr()
         assert "PERFORMANCE" in captured.out
         assert "Physics" in captured.out
+
+
+class TestSimulationCloseMethods:
+    def test_close_no_renderers_is_noop(self, simulation):
+        # Use a fresh Simulation so this mutation cannot leak into other tests that
+        # share the module-scoped fixture instance.
+        fresh_simulation = Simulation(simulation.world)
+        # fresh simulation should have no renderers by default
+        assert fresh_simulation.renderer is None
+        assert fresh_simulation.eye_renderer is None
+        # calling close should be a no-op and not raise
+        fresh_simulation.close()
+
+    def test_close_closes_both_renderers_and_is_idempotent(self, simulation):
+        class _DummyRenderer:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        dummy_a = _DummyRenderer()
+        dummy_b = _DummyRenderer()
+        # Use a fresh Simulation so this mutation cannot leak into other tests that
+        # share the module-scoped fixture instance.
+        fresh_simulation = Simulation(simulation.world)
+        fresh_simulation.renderer = dummy_a
+        fresh_simulation.eye_renderer = dummy_b
+
+        fresh_simulation.close()
+        assert dummy_a.closed is True
+        assert dummy_b.closed is True
+
+        # calling again should not raise and should leave state unchanged
+        fresh_simulation.close()
+        assert dummy_a.closed is True
+        assert dummy_b.closed is True
 
 
 # ==============================================================================
