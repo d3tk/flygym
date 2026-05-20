@@ -8,11 +8,11 @@ from sys import stderr
 import numpy as np
 
 from flygym.compose import OdorPlumeWorld
-from flygym.examples.olfaction.common import add_world_camera, make_olfaction_fly
-from flygym.examples.olfaction.plume_tracking_controller import (
+from flygym_demo.olfaction.common import add_world_camera, make_olfaction_fly
+from flygym_demo.olfaction.plume_tracking_controller import (
     PlumeNavigationController,
 )
-from flygym.examples.olfaction.plume_tracking_task import PlumeNavigationTask
+from flygym_demo.olfaction.plume_tracking_task import PlumeNavigationTask
 from flygym.utils.math import Rotation3D
 
 

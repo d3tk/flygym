@@ -6,11 +6,11 @@ import numpy as np
 
 from flygym import Simulation
 from flygym.compose import OdorWorld
-from flygym.examples.locomotion import (
+from flygym_demo.complex_terrain import (
     HybridTurningController,
     apply_locomotion_action,
 )
-from flygym.examples.olfaction.common import (
+from flygym_demo.olfaction.common import (
     add_fly_to_odor_world,
     add_world_camera,
     make_olfaction_fly,

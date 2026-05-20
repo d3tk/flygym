@@ -5,7 +5,7 @@ from tempfile import TemporaryDirectory
 
 import numpy as np
 
-from flygym.examples.olfaction.track_plume_closed_loop import run_simulation
+from flygym_demo.olfaction.track_plume_closed_loop import run_simulation
 
 
 def save_snapshot(

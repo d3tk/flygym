@@ -1,11 +1,11 @@
-"""Olfaction examples and plume-navigation helpers."""
+"""Olfaction demo helpers used by the tutorial examples."""
 
 from flygym.compose import OdorPlumeWorld, OdorWorld
-from flygym.examples.olfaction.plume_tracking_controller import (
+from flygym_demo.olfaction.plume_tracking_controller import (
     PlumeNavigationController,
     WalkingState,
 )
-from flygym.examples.olfaction.plume_tracking_task import PlumeNavigationTask
+from flygym_demo.olfaction.plume_tracking_task import PlumeNavigationTask
 
 OdorPlumeArena = OdorPlumeWorld
 

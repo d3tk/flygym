@@ -4,8 +4,8 @@ import numpy as np
 import mujoco as mj
 
 from flygym.compose import Fly, OdorPlumeWorld
-from flygym.examples.locomotion import HybridTurningController, apply_locomotion_action
-from flygym.examples.olfaction.common import (
+from flygym_demo.complex_terrain import HybridTurningController, apply_locomotion_action
+from flygym_demo.olfaction.common import (
     add_fly_to_odor_world,
     make_olfaction_observation,
 )

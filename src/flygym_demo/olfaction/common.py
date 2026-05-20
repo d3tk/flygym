@@ -5,7 +5,7 @@ from scipy.spatial.transform import Rotation
 
 from flygym.anatomy import BodySegment, ContactBodiesPreset, LEGS
 from flygym.compose import ActuatorType, Fly, OdorWorld
-from flygym.examples.locomotion import make_locomotion_fly
+from flygym_demo.complex_terrain import make_locomotion_fly
 from flygym.simulation import Simulation
 from flygym.utils.math import Rotation3D
 

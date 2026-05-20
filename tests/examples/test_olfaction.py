@@ -7,13 +7,13 @@ import pytest
 
 from flygym import assets_dir
 from flygym.compose import OdorPlumeWorld
-from flygym.examples.olfaction import (
+from flygym_demo.olfaction import (
     PlumeNavigationController,
     PlumeNavigationTask,
     WalkingState,
 )
-from flygym.examples.olfaction.common import add_world_camera, make_olfaction_fly
-from flygym.examples.olfaction.simple_odor_taxis import run_simulation
+from flygym_demo.olfaction.common import add_world_camera, make_olfaction_fly
+from flygym_demo.olfaction.simple_odor_taxis import run_simulation
 from flygym.utils.math import Rotation3D
 
 
@@ -177,7 +177,7 @@ def test_plume_navigation_task_observation_and_overlay():
 
 def test_plume_simulation_two_step_reference():
     pytest.importorskip("phi.torch")
-    from flygym.examples.olfaction.simulate_plume_dataset import (
+    from flygym_demo.olfaction.simulate_plume_dataset import (
         generate_simulation_inputs,
         get_simulation_parameters,
         run_simulation as run_plume_simulation,
