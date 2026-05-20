@@ -15,14 +15,13 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 cd "${REPO_ROOT}"
 
 export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
-export MUJOCO_GL="${MUJOCO_GL:-egl}"
-export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
-export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
-export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
-export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
-export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-1}"
+export MUJOCO_GL="egl"
+export PYOPENGL_PLATFORM="egl"
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
 
 TIMESTEP=0.0001
 DECISION_STEPS=500
@@ -37,7 +36,7 @@ PROGRESS_REWARD_WEIGHT=10.0
 EVAL_INTERVAL=50000
 EVAL_EPISODES=5
 PROGRESS_INTERVAL_SECONDS=30
-DEVICE="cpu"
+DEVICE="cuda"
 ENV_RUNNER="subproc"
 MP_START_METHOD="spawn"
 
@@ -72,5 +71,4 @@ uv run python scripts/flygym/train_odor_obstacle_navigation.py \
     --wandb-project "${WANDB_PROJECT}" \
     --wandb-mode "${WANDB_MODE}" \
     --wandb-run-name "${WANDB_RUN_NAME}" \
-    --run-dir "${RUN_DIR}" \
-    "$@"
+    --run-dir "${RUN_DIR}"

@@ -196,6 +196,7 @@ class PPOTrainer:
             progress_interval_seconds = None
         global_step = 0
         update_count = 0
+        self._synchronize_device()
         train_started_at = time.perf_counter()
         next_eval_step = eval_interval
         episode_returns = np.zeros(cfg.num_envs, dtype=np.float32)
@@ -227,6 +228,7 @@ class PPOTrainer:
                     "rollout_index": float(update_count),
                 },
             )
+            self._synchronize_device()
             update_started_at = time.perf_counter()
             update_metrics = self._update(
                 rollout,
@@ -236,13 +238,15 @@ class PPOTrainer:
                 update_count=update_count,
                 train_started_at=train_started_at,
             )
+            self._synchronize_device()
+            update_wall_seconds = time.perf_counter() - update_started_at
             _report_progress(
                 progress_callback,
                 {
                     "stage": "update_end",
                     "global_step": float(global_step),
                     "rollout_index": float(update_count),
-                    "update_wall_seconds": time.perf_counter() - update_started_at,
+                    "update_wall_seconds": update_wall_seconds,
                     **update_metrics,
                 },
             )
@@ -291,6 +295,7 @@ class PPOTrainer:
                 metrics_callback(metrics)
             last_metrics = metrics
 
+        self._synchronize_device()
         summary = {
             "global_step": float(global_step),
             "updates": float(update_count),
@@ -401,6 +406,7 @@ class PPOTrainer:
         rollout_returns: list[float] = []
         rollout_lengths: list[int] = []
         rollout_successes: list[float] = []
+        self._synchronize_device()
         rollout_started_at = time.perf_counter()
         next_progress_at = (
             rollout_started_at + progress_interval_seconds
@@ -499,6 +505,7 @@ class PPOTrainer:
             last_gae = delta + cfg.gamma * cfg.gae_lambda * next_nonterminal * last_gae
             advantages[step_idx] = last_gae
         returns = advantages + value_buf
+        self._synchronize_device()
         rollout_wall_seconds = time.perf_counter() - rollout_started_at
         _report_progress(
             progress_callback,
@@ -760,6 +767,10 @@ class PPOTrainer:
 
     def _tensor(self, value: np.ndarray) -> torch.Tensor:
         return torch.as_tensor(value, dtype=torch.float32, device=self.device)
+
+    def _synchronize_device(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
 
 
 def _make_mlp(

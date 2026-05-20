@@ -4,8 +4,16 @@ Fixtures that require building the full MuJoCo fly model (which loads mesh files
 are scoped to the module level so the expensive setup is done only once per test file.
 """
 
+# ruff: noqa: E402
+
 import os
+from pathlib import Path
 import platform
+import sys
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # On Linux, force EGL headless rendering (Mesa, no display server required).
 # On macOS and Windows, mujoco ignores MUJOCO_GL entirely (it hardcodes CGL

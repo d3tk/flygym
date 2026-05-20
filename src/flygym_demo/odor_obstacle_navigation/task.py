@@ -133,8 +133,6 @@ class OdorObstacleNavigationTask:
         self._decision_count = 0
         self._prev_distance_to_target: float | None = None
         self._prev_object_size = 0.0
-        self._last_obs = np.zeros(self.observation_shape, dtype=np.float32)
-        self._last_info: dict[str, Any] = {}
 
         self.fly = self._make_fly()
         self.world = self._make_world()
@@ -208,8 +206,6 @@ class OdorObstacleNavigationTask:
             terminated=False,
             truncated=False,
         )
-        self._last_obs = observation
-        self._last_info = info
         return observation, info
 
     def step(
@@ -242,8 +238,6 @@ class OdorObstacleNavigationTask:
             terminated=terminated,
             truncated=truncated,
         )
-        self._last_obs = observation
-        self._last_info = info
         return observation, reward, terminated, truncated, info
 
     def set_layout(
