@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import multiprocessing as mp
+import os
+from pathlib import Path
+import time
 import traceback
 from typing import Any, Callable
 
@@ -84,6 +87,12 @@ class SyncTaskRunner:
         for task in self.tasks:
             task.close()
 
+    def diagnostics(self) -> list[dict[str, Any]]:
+        return [
+            _task_diagnostics(task, rank=rank)
+            for rank, task in enumerate(self.tasks)
+        ]
+
 
 class SubprocTaskRunner:
     def __init__(
@@ -98,11 +107,11 @@ class SubprocTaskRunner:
         self._closed = False
         self._conns = []
         self._processes = []
-        for _ in range(num_envs):
+        for rank in range(num_envs):
             parent_conn, child_conn = self._ctx.Pipe()
             process = self._ctx.Process(
                 target=_task_worker,
-                args=(child_conn, task_factory),
+                args=(child_conn, task_factory, rank),
                 daemon=False,
             )
             process.start()
@@ -196,6 +205,11 @@ class SubprocTaskRunner:
             conn.send(("spec", None))
         return [self._recv(idx) for idx in range(self.num_envs)]
 
+    def diagnostics(self) -> list[dict[str, Any]]:
+        for conn in self._conns:
+            conn.send(("diagnostics", None))
+        return [self._recv(idx) for idx in range(self.num_envs)]
+
     def _recv(self, idx: int):
         try:
             status, payload = self._conns[idx].recv()
@@ -210,9 +224,26 @@ def make_task_runner(
     task_factory: Callable[[], Any],
     *,
     num_envs: int,
+    env_device: str,
     env_runner: str,
     mp_start_method: str,
 ):
+    if env_device == "cuda":
+        if env_runner not in {"warp", "subproc"}:
+            raise ValueError(
+                "CUDA environment stepping uses the Warp runner; "
+                f"got env_runner={env_runner!r}."
+            )
+        from flygym_demo.odor_obstacle_navigation.warp_runner import (
+            WarpNavigationTaskRunner,
+        )
+
+        config = getattr(task_factory, "config", None)
+        if config is None:
+            raise TypeError("WarpNavigationTaskRunner requires a NavigationTaskFactory.")
+        return WarpNavigationTaskRunner(config, num_envs=num_envs)
+    if env_device != "cpu":
+        raise ValueError(f"Unsupported env_device: {env_device}")
     if env_runner == "sync":
         return SyncTaskRunner(task_factory, num_envs)
     if env_runner == "subproc":
@@ -224,7 +255,7 @@ def make_task_runner(
     raise ValueError(f"Unsupported env_runner: {env_runner}")
 
 
-def _task_worker(conn, task_factory: Callable[[], Any]) -> None:
+def _task_worker(conn, task_factory: Callable[[], Any], rank: int) -> None:
     task = None
     try:
         task = task_factory()
@@ -232,6 +263,8 @@ def _task_worker(conn, task_factory: Callable[[], Any]) -> None:
             command, payload = conn.recv()
             if command == "spec":
                 conn.send(("ok", _task_spec(task)))
+            elif command == "diagnostics":
+                conn.send(("ok", _task_diagnostics(task, rank=rank)))
             elif command == "reset":
                 obs, info = task.reset(seed=payload)
                 conn.send(("ok", (np.asarray(obs, dtype=np.float32), info)))
@@ -271,6 +304,55 @@ def _task_spec(task) -> TaskRunnerSpec:
         decision_steps=float(getattr(config, "decision_steps", 1)),
         decision_interval=float(getattr(config, "decision_interval", 1.0)),
     )
+
+
+def _task_diagnostics(task, *, rank: int) -> dict[str, Any]:
+    config = getattr(task, "config", None)
+    return {
+        "rank": int(rank),
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+        "cpu_affinity": _cpu_affinity(),
+        "cpu_affinity_count": _cpu_affinity_count(),
+        "cpu_seconds": _process_cpu_seconds(os.getpid()),
+        "rss_bytes": _process_rss_bytes(os.getpid()),
+        "wall_time_seconds": time.time(),
+        "observation_shape": tuple(getattr(task, "observation_shape", ())),
+        "decision_steps": int(getattr(config, "decision_steps", 0)),
+        "decision_interval": float(getattr(config, "decision_interval", 0.0)),
+        "enable_vision": bool(getattr(config, "enable_vision", False)),
+        "enable_olfaction": bool(getattr(config, "enable_olfaction", False)),
+        "randomize_layout": bool(getattr(config, "randomize_layout", False)),
+    }
+
+
+def _cpu_affinity() -> list[int] | None:
+    if not hasattr(os, "sched_getaffinity"):
+        return None
+    return sorted(os.sched_getaffinity(0))
+
+
+def _cpu_affinity_count() -> int | None:
+    affinity = _cpu_affinity()
+    return None if affinity is None else len(affinity)
+
+
+def _process_cpu_seconds(pid: int) -> float | None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = stat.rsplit(")", maxsplit=1)[1].split()
+        ticks_per_second = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+        return (float(fields[11]) + float(fields[12])) / ticks_per_second
+    except (FileNotFoundError, IndexError, KeyError, OSError, ValueError):
+        return None
+
+
+def _process_rss_bytes(pid: int) -> int | None:
+    try:
+        statm = Path(f"/proc/{pid}/statm").read_text(encoding="utf-8").split()
+        return int(statm[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (FileNotFoundError, IndexError, OSError, ValueError):
+        return None
 
 
 def _indexed_seeds(seed: int | None, n: int) -> list[int | None]:

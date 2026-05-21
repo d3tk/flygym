@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
+from pathlib import Path
+
 import numpy as np
 import pytest
 import mujoco as mj
@@ -273,6 +277,23 @@ def test_subproc_real_task_short_rollout_runs():
         assert truncated.shape == (2,)
     finally:
         runner.close()
+
+
+def test_benchmark_supports_cuda_vision_feature_mode():
+    benchmark_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts/flygym/benchmark_odor_obstacle_navigation_training.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "benchmark_odor_obstacle_navigation_training", benchmark_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    assert module._supports_feature_mode("cuda", vision=True, olfaction=True)
+    assert module._supports_feature_mode("cuda", vision=True, olfaction=False)
 
 
 class StubTaskConfig:

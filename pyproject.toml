@@ -90,6 +90,17 @@ repository = "https://github.com/NeLy-EPFL/flygym"
 documentation = "https://neuromechfly.org/"
 "Bug Tracker" = "https://github.com/NeLy-EPFL/flygym/issues"
 
+[tool.uv.sources]
+# Default PyPI torch on Linux targets CUDA 13 and needs a newer driver than our Slurm nodes.
+torch = [
+    { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

@@ -32,6 +32,7 @@ class PPOConfig:
     normalize_observations: bool = True
     seed: int = 0
     device: str = "cpu"
+    env_device: str = "cpu"
     env_runner: str = "sync"
     mp_start_method: str = "spawn"
 
@@ -42,6 +43,11 @@ class RolloutStats:
     lengths: list[int]
     successes: list[float]
     wall_seconds: float
+    phase_wall_seconds: dict[str, float]
+    worker_cpu_percent_sum: float | None
+    worker_cpu_percent_mean: float | None
+    worker_cpu_percent_max: float | None
+    worker_count: int
 
 
 class RunningMeanStd:
@@ -149,6 +155,7 @@ class PPOTrainer:
         self.runner = make_task_runner(
             task_factory,
             num_envs=config.num_envs,
+            env_device=config.env_device,
             env_runner=config.env_runner,
             mp_start_method=config.mp_start_method,
         )
@@ -172,6 +179,8 @@ class PPOTrainer:
             eps=1e-5,
         )
         self._cpu_sampler = _ParentCpuSampler()
+        self._worker_cpu_sampler = _WorkerCpuSampler()
+        self._worker_cpu_sampler.sample(self.worker_diagnostics())
         self.optimizer_step = 0
 
     def train(
@@ -380,6 +389,33 @@ class PPOTrainer:
     def close(self) -> None:
         self.runner.close()
 
+    def worker_diagnostics(self) -> list[dict[str, Any]]:
+        diagnostics = getattr(self.runner, "diagnostics", None)
+        if diagnostics is None:
+            return []
+        return diagnostics()
+
+    def diagnostics(self) -> dict[str, Any]:
+        parent_affinity = None
+        if hasattr(os, "sched_getaffinity"):
+            parent_affinity = sorted(os.sched_getaffinity(0))
+        return {
+            "parent": {
+                "pid": os.getpid(),
+                "cpu_affinity": parent_affinity,
+                "cpu_affinity_count": (
+                    None if parent_affinity is None else len(parent_affinity)
+                ),
+                "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+                "slurm_cpus_per_task": os.environ.get("SLURM_CPUS_PER_TASK"),
+                "slurm_cpus_on_node": os.environ.get("SLURM_CPUS_ON_NODE"),
+            },
+            "runner": self.config.env_runner,
+            "env_device": self.config.env_device,
+            "requested_envs": self.config.num_envs,
+            "workers": self.worker_diagnostics(),
+        }
+
     def _collect_rollout(
         self,
         episode_returns: np.ndarray,
@@ -406,6 +442,16 @@ class PPOTrainer:
         rollout_returns: list[float] = []
         rollout_lengths: list[int] = []
         rollout_successes: list[float] = []
+        phase_wall_seconds = {
+            "obs_normalize": 0.0,
+            "policy_forward": 0.0,
+            "action_transfer": 0.0,
+            "env_step": 0.0,
+            "reset": 0.0,
+            "bootstrap": 0.0,
+            "advantage": 0.0,
+            "tensorize": 0.0,
+        }
         self._synchronize_device()
         rollout_started_at = time.perf_counter()
         next_progress_at = (
@@ -428,18 +474,32 @@ class PPOTrainer:
         )
 
         for step_idx in range(cfg.rollout_steps):
+            phase_started_at = time.perf_counter()
             self.obs_rms.update(self.obs)
             obs_tensor = self._obs_tensor(self.obs)
+            phase_wall_seconds["obs_normalize"] += (
+                time.perf_counter() - phase_started_at
+            )
+            phase_started_at = time.perf_counter()
             with torch.no_grad():
                 action, logprob, _, value = self.model.get_action_and_value(obs_tensor)
+            phase_wall_seconds["policy_forward"] += (
+                time.perf_counter() - phase_started_at
+            )
 
+            phase_started_at = time.perf_counter()
             actions = action.cpu().numpy().astype(np.float32)
             obs_buf[step_idx] = self.obs
             action_buf[step_idx] = actions
             logprob_buf[step_idx] = logprob.cpu().numpy()
             value_buf[step_idx] = value.cpu().numpy()
+            phase_wall_seconds["action_transfer"] += (
+                time.perf_counter() - phase_started_at
+            )
 
+            phase_started_at = time.perf_counter()
             next_obs, rewards, terminated, truncated, infos = self.runner.step(actions)
+            phase_wall_seconds["env_step"] += time.perf_counter() - phase_started_at
             done = np.logical_or(terminated, truncated)
             reward_buf[step_idx] = rewards
             done_buf[step_idx] = done.astype(np.float32)
@@ -459,7 +519,9 @@ class PPOTrainer:
                 episode_returns[env_idx] = 0.0
                 episode_lengths[env_idx] = 0
             if done_indices.size:
+                phase_started_at = time.perf_counter()
                 reset_obs, _ = self.runner.reset_at(done_indices)
+                phase_wall_seconds["reset"] += time.perf_counter() - phase_started_at
                 next_obs[done_indices] = reset_obs
             self.obs = next_obs
             now = time.perf_counter()
@@ -486,9 +548,12 @@ class PPOTrainer:
                 while next_progress_at <= now:
                     next_progress_at += progress_interval_seconds
 
+        phase_started_at = time.perf_counter()
         with torch.no_grad():
             next_value = self.model.get_value(self._obs_tensor(self.obs)).cpu().numpy()
+        phase_wall_seconds["bootstrap"] += time.perf_counter() - phase_started_at
 
+        phase_started_at = time.perf_counter()
         advantages = np.zeros_like(reward_buf)
         last_gae = np.zeros(cfg.num_envs, dtype=np.float32)
         for step_idx in reversed(range(cfg.rollout_steps)):
@@ -505,36 +570,56 @@ class PPOTrainer:
             last_gae = delta + cfg.gamma * cfg.gae_lambda * next_nonterminal * last_gae
             advantages[step_idx] = last_gae
         returns = advantages + value_buf
+        phase_wall_seconds["advantage"] += time.perf_counter() - phase_started_at
         self._synchronize_device()
         rollout_wall_seconds = time.perf_counter() - rollout_started_at
+        worker_diagnostics = self.worker_diagnostics()
+        worker_cpu_summary = self._worker_cpu_sampler.sample(worker_diagnostics)
+        progress_event = self._rollout_progress_metrics(
+            stage="rollout_end",
+            global_step=global_step_start + cfg.rollout_steps * cfg.num_envs,
+            update_count=update_count,
+            rollout_step=cfg.rollout_steps,
+            rollout_elapsed=rollout_wall_seconds,
+            decision_steps=decision_steps,
+            decision_interval=decision_interval,
+            completed_episodes=len(rollout_returns),
+        )
+        phase_started_at = time.perf_counter()
+        rollout_tensors = {
+            "obs": self._tensor(obs_buf.reshape(-1, self.obs.shape[1])),
+            "actions": self._tensor(action_buf.reshape(-1, self.action_dim)),
+            "logprobs": self._tensor(logprob_buf.ravel()),
+            "advantages": self._tensor(advantages.ravel()),
+            "returns": self._tensor(returns.ravel()),
+            "values": self._tensor(value_buf.ravel()),
+        }
+        phase_wall_seconds["tensorize"] += time.perf_counter() - phase_started_at
+        progress_event.update(_phase_metrics(phase_wall_seconds))
+        progress_event.update(worker_cpu_summary)
         _report_progress(
             progress_callback,
-            self._rollout_progress_metrics(
-                stage="rollout_end",
-                global_step=global_step_start + cfg.rollout_steps * cfg.num_envs,
-                update_count=update_count,
-                rollout_step=cfg.rollout_steps,
-                rollout_elapsed=rollout_wall_seconds,
-                decision_steps=decision_steps,
-                decision_interval=decision_interval,
-                completed_episodes=len(rollout_returns),
-            ),
+            progress_event,
         )
 
         return (
-            {
-                "obs": self._tensor(obs_buf.reshape(-1, self.obs.shape[1])),
-                "actions": self._tensor(action_buf.reshape(-1, self.action_dim)),
-                "logprobs": self._tensor(logprob_buf.ravel()),
-                "advantages": self._tensor(advantages.ravel()),
-                "returns": self._tensor(returns.ravel()),
-                "values": self._tensor(value_buf.ravel()),
-            },
+            rollout_tensors,
             RolloutStats(
                 returns=rollout_returns,
                 lengths=rollout_lengths,
                 successes=rollout_successes,
                 wall_seconds=rollout_wall_seconds,
+                phase_wall_seconds=phase_wall_seconds,
+                worker_cpu_percent_sum=worker_cpu_summary[
+                    "worker_cpu_percent_sum"
+                ],
+                worker_cpu_percent_mean=worker_cpu_summary[
+                    "worker_cpu_percent_mean"
+                ],
+                worker_cpu_percent_max=worker_cpu_summary[
+                    "worker_cpu_percent_max"
+                ],
+                worker_count=int(worker_cpu_summary["worker_count"]),
             ),
         )
 
@@ -700,8 +785,24 @@ class PPOTrainer:
             ),
             "speed/rollout_index": float(update_count),
             "speed/parent_cpu_percent": self._cpu_sampler.sample(),
+            "speed/worker_cpu_percent_sum": _none_to_zero(
+                rollout_stats.worker_cpu_percent_sum
+            ),
+            "speed/worker_cpu_percent_mean": _none_to_zero(
+                rollout_stats.worker_cpu_percent_mean
+            ),
+            "speed/worker_cpu_percent_max": _none_to_zero(
+                rollout_stats.worker_cpu_percent_max
+            ),
+            "speed/worker_count": float(rollout_stats.worker_count),
             "global_step": float(global_step),
         }
+        metrics.update(
+            {
+                f"speed/phase_{phase}_wall_seconds": seconds
+                for phase, seconds in rollout_stats.phase_wall_seconds.items()
+            }
+        )
         if rollout_stats.returns:
             metrics.update(
                 {
@@ -821,9 +922,20 @@ def _report_progress(
         callback(event)
 
 
+def _phase_metrics(phase_wall_seconds: dict[str, float]) -> dict[str, float]:
+    return {
+        f"phase_{phase}_wall_seconds": float(seconds)
+        for phase, seconds in phase_wall_seconds.items()
+    }
+
+
+def _none_to_zero(value: float | None) -> float:
+    return 0.0 if value is None else float(value)
+
+
 class _ParentCpuSampler:
     def __init__(self) -> None:
-        self._pid = os.getppid()
+        self._pid = os.getpid()
         self._ticks_per_second = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
         self._last_cpu_seconds = self._read_cpu_seconds()
         self._last_wall_seconds = time.perf_counter()
@@ -841,3 +953,43 @@ class _ParentCpuSampler:
         stat = Path(f"/proc/{self._pid}/stat").read_text(encoding="utf-8")
         fields = stat.rsplit(")", maxsplit=1)[1].split()
         return (float(fields[11]) + float(fields[12])) / self._ticks_per_second
+
+
+class _WorkerCpuSampler:
+    def __init__(self) -> None:
+        self._last_cpu_seconds_by_pid: dict[int, float] = {}
+        self._last_wall_seconds = time.perf_counter()
+
+    def sample(self, diagnostics: list[dict[str, Any]]) -> dict[str, float | None]:
+        wall_seconds = time.perf_counter()
+        wall_delta = wall_seconds - self._last_wall_seconds
+        worker_cpu_percent: list[float] = []
+        current_cpu_seconds_by_pid: dict[int, float] = {}
+        for diagnostic in diagnostics:
+            pid = diagnostic.get("pid")
+            cpu_seconds = diagnostic.get("cpu_seconds")
+            if pid is None or cpu_seconds is None:
+                continue
+            pid = int(pid)
+            cpu_seconds = float(cpu_seconds)
+            current_cpu_seconds_by_pid[pid] = cpu_seconds
+            previous_cpu_seconds = self._last_cpu_seconds_by_pid.get(pid)
+            if previous_cpu_seconds is not None:
+                worker_cpu_percent.append(
+                    _rate((cpu_seconds - previous_cpu_seconds) * 100.0, wall_delta)
+                )
+        self._last_cpu_seconds_by_pid = current_cpu_seconds_by_pid
+        self._last_wall_seconds = wall_seconds
+        if not worker_cpu_percent:
+            return {
+                "worker_cpu_percent_sum": None,
+                "worker_cpu_percent_mean": None,
+                "worker_cpu_percent_max": None,
+                "worker_count": float(len(diagnostics)),
+            }
+        return {
+            "worker_cpu_percent_sum": float(np.sum(worker_cpu_percent)),
+            "worker_cpu_percent_mean": float(np.mean(worker_cpu_percent)),
+            "worker_cpu_percent_max": float(np.max(worker_cpu_percent)),
+            "worker_count": float(len(diagnostics)),
+        }

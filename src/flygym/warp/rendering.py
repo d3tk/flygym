@@ -19,6 +19,8 @@ from flygym.utils.plot import find_font_path
 
 
 class _BaseWarpRenderer(Renderer, ABC):
+    _requires_mj_renderer = True
+
     @override
     def __init__(
         self,
@@ -32,19 +34,32 @@ class _BaseWarpRenderer(Renderer, ABC):
         output_fps: int = 25,
         buffer_frames: bool = True,
         scene_option: mj.MjvOption | None = None,
+        enabled_geom_groups: list[int] | None = None,
         **kwargs: Any,
     ):
-        # Common setup using MjRenderer
-        super().__init__(
-            mj_model,
-            cameras,
-            camera_res=camera_res,
-            playback_speed=playback_speed,
-            output_fps=output_fps,
-            buffer_frames=buffer_frames,
-            scene_option=scene_option,
-            **kwargs,
-        )
+        # Common setup using MjRenderer when needed. GPU batch rendering does not
+        # use MuJoCo's OpenGL renderer, so avoid creating an OpenGL context there.
+        if self._requires_mj_renderer:
+            super().__init__(
+                mj_model,
+                cameras,
+                camera_res=camera_res,
+                playback_speed=playback_speed,
+                output_fps=output_fps,
+                buffer_frames=buffer_frames,
+                scene_option=scene_option,
+                **kwargs,
+            )
+        else:
+            self._init_without_mj_renderer(
+                mj_model,
+                cameras,
+                camera_res=camera_res,
+                playback_speed=playback_speed,
+                output_fps=output_fps,
+                buffer_frames=buffer_frames,
+                scene_option=scene_option,
+            )
 
         # Warp-specific setup
         self.mjw_model = mjw.put_model(mj_model)
@@ -89,7 +104,49 @@ class _BaseWarpRenderer(Renderer, ABC):
         else:
             self._frames = None
 
-        self._render_setup_impl(**kwargs)
+        self._render_setup_impl(enabled_geom_groups=enabled_geom_groups, **kwargs)
+
+    def _init_without_mj_renderer(
+        self,
+        mj_model: mj.MjModel,
+        cameras: str | mjcf.Element | list[str | mjcf.Element],
+        *,
+        camera_res: tuple[int, int],
+        playback_speed: float,
+        output_fps: int,
+        buffer_frames: bool,
+        scene_option: mj.MjvOption | None,
+    ) -> None:
+        self.mj_model = mj_model
+        self.camera_res = camera_res
+        self.buffer_frames = buffer_frames
+        self.mj_renderer = None
+        if scene_option is None:
+            self.scene_option = mj.MjvOption()
+        else:
+            self.scene_option = scene_option
+        mj.mjv_defaultOption(self.scene_option)
+
+        self._cameras_names2id = {}
+        for spec in cameras if isinstance(cameras, list) else [cameras]:
+            cam_id, cam_name = self._resolve_camera_id_and_name(spec)
+            if cam_id == -1:
+                raise ValueError(f"Camera {spec} not found in the model.")
+            if cam_name in self._cameras_names2id:
+                raise ValueError(f"Duplicate camera name detected: {cam_name}.")
+            self._cameras_names2id[cam_name] = cam_id
+        if len(self._cameras_names2id) == 0:
+            raise ValueError("At least one valid camera must be specified.")
+        self._cameras_id2name = {v: k for k, v in self._cameras_names2id.items()}
+
+        self.playback_speed = playback_speed
+        self.output_fps = output_fps
+        self._secs_between_renders = 1 / (output_fps / playback_speed)
+        self._last_render_time_sec = -np.inf
+        if self.buffer_frames:
+            self.frames = {cam_name: [] for cam_name in self._cameras_names2id}
+        else:
+            self.frames = None
 
     @override
     def render_as_needed(self, mjw_data: mjw.Data) -> bool:
@@ -262,7 +319,9 @@ class _BaseWarpRenderer(Renderer, ABC):
         return merged_frames
 
     @abstractmethod
-    def _render_setup_impl(self, **kwargs: Any) -> None:
+    def _render_setup_impl(
+        self, enabled_geom_groups: list[int] | None = None, **kwargs: Any
+    ) -> None:
         pass
 
     @abstractmethod
@@ -279,7 +338,11 @@ class _BaseWarpRenderer(Renderer, ABC):
 class WarpGPUBatchRenderer(_BaseWarpRenderer):
     """GPU-side renderer using MJWarp's GPU batch rendering functionality."""
 
-    def _render_setup_impl(self, **kwargs: Any) -> None:
+    _requires_mj_renderer = False
+
+    def _render_setup_impl(
+        self, enabled_geom_groups: list[int] | None = None, **kwargs: Any
+    ) -> None:
         if not self._is_scene_option_default(self.scene_option):
             raise RuntimeError(
                 "Custom scene options are not supported with WarpGPUBatchRenderer "
@@ -295,30 +358,56 @@ class WarpGPUBatchRenderer(_BaseWarpRenderer):
             for cid in range(self.mj_model.ncam)
         ]
 
+        render_context_kwargs = dict(kwargs)
+        if enabled_geom_groups is not None:
+            render_context_kwargs["enabled_geom_groups"] = enabled_geom_groups
+
         # Create batch rendering context
         self._rendering_context = mjw.create_render_context(
             mjm=self.mj_model,
             nworld=self._n_worlds_total,
             cam_active=cam_mask,
             cam_res=self.camera_res[::-1],  # MJWarp expects (W, H); we use (H, W)
-            **kwargs,
+            **render_context_kwargs,
         )
 
         # Remove normal MjRenderer inherited from CPU Renderer
         self.scene_option = None
         self.mj_renderer = None
 
-    def _render_impl(self, mjw_data: mjw.Data) -> bool:
+    def render_rgb(
+        self, mjw_data: mjw.Data, out: wp.array | None = None
+    ) -> wp.array:
+        """Render RGB frames into a reusable GPU buffer.
+
+        Args:
+            mjw_data: Current batched MuJoCo-Warp data.
+            out: Optional `wp.vec3f` buffer with shape
+                `(n_worlds, n_cameras, height, width)`. If omitted, a new buffer
+                is allocated.
+
+        Returns:
+            The GPU buffer containing RGB values in `[0, 1]`.
+        """
+        if out is None:
+            out = wp.zeros(self._buf_dim_per_frame, dtype=wp.vec3f)
+        elif tuple(out.shape) != tuple(self._buf_dim_per_frame):
+            raise ValueError(
+                f"out must have shape {self._buf_dim_per_frame}, got {out.shape}."
+            )
+
         mjw.refit_bvh(self.mjw_model, mjw_data, self._rendering_context)
         mjw.render(self.mjw_model, mjw_data, self._rendering_context)
-        rgb_out = wp.zeros(self._buf_dim_per_frame, dtype=wp.vec3f)
         get_rgb_selected_worlds_and_cameras(
             self._rendering_context,
             self._world_ids_gpu,
             self._enabled_cam_ids_gpu,
-            rgb_out,
+            out,
         )
-        return rgb_out
+        return out
+
+    def _render_impl(self, mjw_data: mjw.Data) -> wp.array:
+        return self.render_rgb(mjw_data)
 
     def _fetch_frames_to_cpu_impl(
         self, world_id_among_rendered: int, cam_id_among_rendered: int
@@ -344,7 +433,10 @@ class WarpGPUBatchRenderer(_BaseWarpRenderer):
 class WarpCPURenderer(_BaseWarpRenderer):
     """CPU-side renderer for multi-world MJWarp simulation."""
 
-    def _render_setup_impl(self, **kwargs: Any) -> None:
+    def _render_setup_impl(
+        self, enabled_geom_groups: list[int] | None = None, **kwargs: Any
+    ) -> None:
+        del enabled_geom_groups
         self._mj_data_buffer = mj.MjData(self.mj_model)
         # Nothing else to do - just use mjRenderer inherited from CPU Renderer
 

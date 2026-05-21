@@ -10,9 +10,35 @@
 
 set -euo pipefail
 
+resolve_repo_root() {
+    local dir="$1"
+    while [[ "${dir}" != "/" ]]; do
+        if [[ -f "${dir}/pyproject.toml" && -f "${dir}/scripts/flygym/train_odor_obstacle_navigation.py" ]]; then
+            echo "${dir}"
+            return 0
+        fi
+        dir="$(dirname "${dir}")"
+    done
+    return 1
+}
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+if ! REPO_ROOT="$(resolve_repo_root "${SCRIPT_DIR}/../..")"; then
+    for start_dir in "${SLURM_SUBMIT_DIR:-}" "${SCRIPT_DIR}"; do
+        if [[ -n "${start_dir}" ]] && REPO_ROOT="$(resolve_repo_root "${start_dir}")"; then
+            break
+        fi
+        REPO_ROOT=""
+    done
+fi
+if [[ -z "${REPO_ROOT:-}" ]]; then
+    echo "Unable to locate flygym repo root (submit from repo root: sbatch scripts/flygym/launch_odor_obstacle_navigation_training.sh)." >&2
+    exit 1
+fi
 cd "${REPO_ROOT}"
+
+# Ensure the locked CUDA 12.6 PyTorch build is installed before training (avoids PyPI cu13 wheels).
+uv sync --frozen --extra warp
 
 export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
 export MUJOCO_GL="egl"
@@ -26,7 +52,7 @@ export VECLIB_MAXIMUM_THREADS=1
 TIMESTEP=0.0001
 DECISION_STEPS=500
 EPISODE_TIME_SECONDS=5
-N_ENVS=8
+N_ENVS=60
 ROLLOUT_STEPS=200
 BATCH_SIZE=1200
 UPDATE_EPOCHS=10
@@ -37,6 +63,7 @@ EVAL_INTERVAL=50000
 EVAL_EPISODES=5
 PROGRESS_INTERVAL_SECONDS=30
 DEVICE="cuda"
+ENV_DEVICE="cpu"
 ENV_RUNNER="subproc"
 MP_START_METHOD="spawn"
 
@@ -65,6 +92,7 @@ uv run python scripts/flygym/train_odor_obstacle_navigation.py \
     --eval-episodes "${EVAL_EPISODES}" \
     --progress-interval-seconds "${PROGRESS_INTERVAL_SECONDS}" \
     --device "${DEVICE}" \
+    --env-device "${ENV_DEVICE}" \
     --env-runner "${ENV_RUNNER}" \
     --mp-start-method "${MP_START_METHOD}" \
     --wandb-entity "${WANDB_ENTITY}" \

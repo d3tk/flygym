@@ -39,7 +39,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress-interval-seconds", type=float, default=30.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--env-runner", choices=["sync", "subproc"], default="sync")
+    parser.add_argument(
+        "--env-device",
+        choices=["cpu", "cuda"],
+        default="cpu",
+        help="Environment stepping device. Use cuda for the MuJoCo-Warp runner.",
+    )
+    parser.add_argument(
+        "--env-runner",
+        choices=["sync", "subproc", "warp"],
+        default="sync",
+    )
     parser.add_argument(
         "--mp-start-method",
         choices=["spawn", "forkserver", "fork"],
@@ -51,6 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-radius", type=float, default=2.0)
     parser.add_argument("--success-bonus", type=float, default=25.0)
     parser.add_argument("--progress-reward-weight", type=float, default=10.0)
+    parser.add_argument("--vision", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--olfaction", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--randomize-layout", action="store_true")
     parser.add_argument(
         "--run-dir",
@@ -88,6 +100,8 @@ def main() -> None:
         target_radius=args.target_radius,
         success_bonus=args.success_bonus,
         progress_reward_weight=args.progress_reward_weight,
+        enable_vision=args.vision,
+        enable_olfaction=args.olfaction,
         randomize_layout=args.randomize_layout,
         render=False,
     )
@@ -104,6 +118,7 @@ def main() -> None:
         value_coef=args.value_coef,
         seed=args.seed,
         device=args.device,
+        env_device=args.env_device,
         env_runner=args.env_runner,
         mp_start_method=args.mp_start_method,
     )
@@ -119,6 +134,7 @@ def main() -> None:
         f"rollout_steps={args.rollout_steps} "
         f"decision_steps={args.decision_steps} "
         f"decision_interval={task_config.decision_interval:.6f}s "
+        f"env_device={args.env_device} "
         f"env_runner={args.env_runner} "
         f"wandb={'off' if args.no_wandb else args.wandb_mode}",
         flush=True,
@@ -128,6 +144,14 @@ def main() -> None:
     trainer = PPOTrainer(
         task_factory,
         ppo_config,
+    )
+    worker_diagnostics_path = args.run_dir / "worker_diagnostics.json"
+    with worker_diagnostics_path.open("w", encoding="utf-8") as f:
+        json.dump(trainer.diagnostics(), f, indent=2)
+    print(
+        "[train] "
+        f"worker diagnostics written to {worker_diagnostics_path}",
+        flush=True,
     )
     try:
         metrics = trainer.train(
@@ -172,6 +196,8 @@ def _json_ready(
             "target_radius": task_config.target_radius,
             "success_bonus": task_config.success_bonus,
             "progress_reward_weight": task_config.progress_reward_weight,
+            "enable_vision": task_config.enable_vision,
+            "enable_olfaction": task_config.enable_olfaction,
             "randomize_layout": task_config.randomize_layout,
             "odor_source": task_config.odor_source.tolist(),
             "obstacle_positions": task_config.obstacle_positions.tolist(),
@@ -185,6 +211,7 @@ def _json_ready(
             "learning_rate": ppo_config.learning_rate,
             "seed": ppo_config.seed,
             "device": ppo_config.device,
+            "env_device": ppo_config.env_device,
             "env_runner": ppo_config.env_runner,
             "mp_start_method": ppo_config.mp_start_method,
         },
@@ -239,6 +266,15 @@ def _print_progress(event: dict) -> None:
             flush=True,
         )
     elif stage in {"rollout", "rollout_end"}:
+        phase_text = ""
+        if stage == "rollout_end":
+            phase_text = (
+                f" env_step={event.get('phase_env_step_wall_seconds', 0.0):.1f}s"
+                f" policy={event.get('phase_policy_forward_wall_seconds', 0.0):.1f}s"
+                f" transfer={event.get('phase_action_transfer_wall_seconds', 0.0):.1f}s"
+                f" reset={event.get('phase_reset_wall_seconds', 0.0):.1f}s"
+                f" worker_cpu_sum={event.get('worker_cpu_percent_sum', 0.0) or 0.0:.1f}%"
+            )
         print(
             "[train] "
             f"rollout={int(event['rollout_index'])} "
@@ -248,7 +284,8 @@ def _print_progress(event: dict) -> None:
             f"decisions/s={event['rollout_timesteps_per_sec']:.2f} "
             f"substeps/s={event['simulator_substeps_per_sec']:.0f} "
             f"sim_s/s={event['simulated_seconds_per_sec']:.3f} "
-            f"episodes={int(event['episodes_completed'])}",
+            f"episodes={int(event['episodes_completed'])}"
+            f"{phase_text}",
             flush=True,
         )
     elif stage == "update_start":
