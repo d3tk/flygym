@@ -330,9 +330,7 @@ class WarpNavigationTaskRunner:
         )
 
     def _forward(self) -> None:
-        forward = getattr(mjw, "forward", None)
-        if forward is not None:
-            forward(self.sim.mjw_model, self.sim.mjw_data)
+        mjw.forward(self.sim.mjw_model, self.sim.mjw_data)
 
     def _find_root_addresses(self) -> tuple[int, int]:
         free_joint_ids = [

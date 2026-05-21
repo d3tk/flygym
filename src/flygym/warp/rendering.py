@@ -83,7 +83,7 @@ class _BaseWarpRenderer(Renderer, ABC):
         if not isinstance(cameras, list):
             cameras = [cameras]
         self.enabled_cam_names = []
-        for cam in cameras if isinstance(cameras, list) else [cameras]:
+        for cam in cameras:
             _, cam_name = self._resolve_camera_id_and_name(cam)
             self.enabled_cam_names.append(cam_name)
         if len(self.enabled_cam_names) == 0:

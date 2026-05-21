@@ -184,7 +184,7 @@ def main() -> None:
                             "Skipping "
                             f"ppo_device={ppo_device} env_device={env_device} "
                             f"runner={runner} features={feature_mode}: "
-                            "Warp runner does not yet implement vision.",
+                            "unsupported feature mode.",
                             flush=True,
                         )
                         continue
@@ -545,7 +545,6 @@ def _requested_feature_modes(args: argparse.Namespace) -> list[str]:
 
 
 def _supports_feature_mode(env_device: str, vision: bool, olfaction: bool) -> bool:
-    del env_device, vision, olfaction
     return True
 
 
