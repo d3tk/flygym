@@ -18,10 +18,13 @@ from flygym_demo.complex_terrain.common import dof_spec_to_jointdof
 from flygym_demo.complex_terrain.cpg_controller import make_tripod_cpg_network
 from flygym_demo.complex_terrain.preprogrammed import PreprogrammedSteps
 from flygym_demo.odor_obstacle_navigation.task import (
+    ACTION_PRESET_NAMES,
+    ACTION_PRESET_VALUES,
     NavigationTaskConfig,
     _compute_ommatidia_coms,
     _empty_vision_features,
     _odor_by_side,
+    _project_action_norm,
     _yaw_to_quat_wxyz,
 )
 from flygym_demo.odor_obstacle_navigation.world import ObstacleOdorWorld
@@ -85,11 +88,7 @@ def _accumulate_ommatidia_readouts_kernel(
     else:
         value = color[2]
     value = value / num_pixels_per_ommatidium[ommatidium_idx]
-    readout_col = (
-        eye_idx * num_ommatidia_per_eye * 2
-        + ommatidium_idx * 2
-        + channel_idx
-    )
+    readout_col = eye_idx * num_ommatidia_per_eye * 2 + ommatidium_idx * 2 + channel_idx
     wp.atomic_add(readouts, world_idx, readout_col, value)
 
 
@@ -132,8 +131,21 @@ class WarpNavigationTaskRunner:
         if self.config.render:
             raise NotImplementedError("WarpNavigationTaskRunner does not render.")
         self.num_envs = int(num_envs)
-        self.action_low = np.full(2, self.config.action_bounds[0], dtype=np.float32)
-        self.action_high = np.full(2, self.config.action_bounds[1], dtype=np.float32)
+        self.action_space = self.config.action_space
+        if self.action_space == "continuous":
+            self.action_shape = (2,)
+            self.action_n = None
+            self.action_low = np.full(2, self.config.action_bounds[0], dtype=np.float32)
+            self.action_high = np.full(
+                2, self.config.action_bounds[1], dtype=np.float32
+            )
+            self.action_max_norm = self.config.action_max_norm
+        else:
+            self.action_shape = ()
+            self.action_n = len(ACTION_PRESET_NAMES)
+            self.action_low = np.array([0], dtype=np.int64)
+            self.action_high = np.array([self.action_n - 1], dtype=np.int64)
+            self.action_max_norm = None
         self.observation_shape = (8,)
 
         self.fly = make_locomotion_fly()
@@ -195,8 +207,7 @@ class WarpNavigationTaskRunner:
 
     def reset(self, seed: int | None = None) -> tuple[np.ndarray, list[dict[str, Any]]]:
         seeds = [
-            None if seed is None else int(seed) + idx
-            for idx in range(self.num_envs)
+            None if seed is None else int(seed) + idx for idx in range(self.num_envs)
         ]
         return self.reset_at(range(self.num_envs), seeds)
 
@@ -250,6 +261,7 @@ class WarpNavigationTaskRunner:
                 features[row],
                 0.0,
                 0.0,
+                0.0,
                 False,
                 False,
                 fly_position=fly_positions[row],
@@ -263,10 +275,7 @@ class WarpNavigationTaskRunner:
         self,
         actions: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[dict[str, Any]]]:
-        actions = np.asarray(actions, dtype=np.float32)
-        if actions.shape != (self.num_envs, 2):
-            raise ValueError(f"actions must have shape ({self.num_envs}, 2).")
-        actions = np.clip(actions, self.action_low, self.action_high)
+        actions = self._resolve_actions(actions)
 
         for _ in range(self.config.decision_steps):
             joint_angles, adhesion = self.controller.step(actions)
@@ -282,7 +291,9 @@ class WarpNavigationTaskRunner:
         distances = self._distance_to_target(fly_positions, indices)
         successes = distances <= self.config.target_radius
         progress = self._prev_distance_to_target - distances
-        rewards = self.config.progress_reward_weight * progress
+        rewards = (
+            self.config.progress_reward_weight * progress - self.config.time_penalty
+        )
         rewards = rewards.astype(np.float32)
         rewards[successes] += self.config.success_bonus
         self._prev_distance_to_target = distances.astype(np.float32)
@@ -296,6 +307,7 @@ class WarpNavigationTaskRunner:
                 int(env_idx),
                 features[row],
                 float(self.config.progress_reward_weight * progress[env_idx]),
+                float(-self.config.time_penalty),
                 float(self.config.success_bonus if terminated[env_idx] else 0.0),
                 bool(terminated[env_idx]),
                 bool(truncated[env_idx]),
@@ -321,6 +333,37 @@ class WarpNavigationTaskRunner:
             obstacle_height=self.config.obstacle_height,
             obstacle_colors=self.config.obstacle_colors,
         )
+
+    def _resolve_actions(self, actions: np.ndarray) -> np.ndarray:
+        if self.action_space == "continuous":
+            actions = np.asarray(actions, dtype=np.float32)
+            if actions.shape != (self.num_envs, 2):
+                raise ValueError(f"actions must have shape ({self.num_envs}, 2).")
+            actions = np.clip(actions, self.action_low, self.action_high)
+            return np.stack(
+                [
+                    _project_action_norm(action, self.action_max_norm)
+                    for action in actions
+                ]
+            ).astype(np.float32)
+
+        action_indices = np.asarray(actions)
+        if action_indices.shape == (self.num_envs, 1):
+            action_indices = action_indices[:, 0]
+        if action_indices.shape != (self.num_envs,):
+            raise ValueError(
+                f"discrete actions must have shape ({self.num_envs},) "
+                f"or ({self.num_envs}, 1)."
+            )
+        if np.issubdtype(action_indices.dtype, np.floating):
+            if not np.all(np.equal(action_indices, np.floor(action_indices))):
+                raise ValueError("discrete actions must be integer indices.")
+        action_indices = action_indices.astype(np.int64)
+        if np.any((action_indices < 0) | (action_indices >= len(ACTION_PRESET_VALUES))):
+            raise ValueError(
+                f"discrete action indices must be in [0, {len(ACTION_PRESET_VALUES) - 1}]."
+            )
+        return ACTION_PRESET_VALUES[action_indices].astype(np.float32, copy=True)
 
     def _copy_rows(self, dst, rows_wp, values: np.ndarray) -> None:
         wp.launch(
@@ -572,6 +615,7 @@ class WarpNavigationTaskRunner:
         env_idx: int,
         features: dict[str, Any],
         progress_reward: float,
+        time_reward: float,
         success_reward: float,
         terminated: bool,
         truncated: bool,
@@ -588,8 +632,9 @@ class WarpNavigationTaskRunner:
             )
         reward_terms = {
             "progress": float(progress_reward),
+            "time": float(time_reward),
             "success": float(success_reward),
-            "total": float(progress_reward + success_reward),
+            "total": float(progress_reward + time_reward + success_reward),
         }
         return {
             "sim_time": float(
