@@ -9,7 +9,7 @@ from typing import Callable, Any
 import numpy as np
 import torch
 from torch import nn
-from torch.distributions import Normal
+from torch.distributions import Categorical, Normal
 
 from flygym_demo.odor_obstacle_navigation.runners import make_task_runner
 
@@ -95,23 +95,37 @@ class ActorCritic(nn.Module):
     def __init__(
         self,
         obs_dim: int,
+        action_space: str,
         action_dim: int,
-        action_low: np.ndarray,
-        action_high: np.ndarray,
+        action_low: np.ndarray | None = None,
+        action_high: np.ndarray | None = None,
+        action_max_norm: float | None = None,
         hidden_sizes: tuple[int, ...] = (128, 128),
     ) -> None:
         super().__init__()
+        self.action_space = action_space
         self.actor = _make_mlp(obs_dim, hidden_sizes, action_dim)
         self.critic = _make_mlp(obs_dim, hidden_sizes, 1)
-        self.log_std = nn.Parameter(torch.zeros(action_dim))
-        self.register_buffer(
-            "action_low",
-            torch.as_tensor(action_low, dtype=torch.float32),
-        )
-        self.register_buffer(
-            "action_scale",
-            torch.as_tensor((action_high - action_low) / 2, dtype=torch.float32),
-        )
+        if action_space == "continuous":
+            if action_low is None or action_high is None:
+                raise ValueError("continuous policies require action bounds.")
+            self.log_std = nn.Parameter(torch.zeros(action_dim))
+            self.register_buffer(
+                "action_low",
+                torch.as_tensor(action_low, dtype=torch.float32),
+            )
+            self.register_buffer(
+                "action_scale",
+                torch.as_tensor((action_high - action_low) / 2, dtype=torch.float32),
+            )
+            self.action_max_norm = action_max_norm
+        elif action_space == "discrete":
+            self.log_std = None
+            self.action_max_norm = None
+            self.register_buffer("action_low", torch.empty(0, dtype=torch.float32))
+            self.register_buffer("action_scale", torch.empty(0, dtype=torch.float32))
+        else:
+            raise ValueError(f"Unsupported action_space: {action_space}")
 
     def get_value(self, obs: torch.Tensor) -> torch.Tensor:
         return self.critic(obs).squeeze(-1)
@@ -123,26 +137,52 @@ class ActorCritic(nn.Module):
         *,
         deterministic: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        mean = self.actor(obs)
-        std = self.log_std.exp().expand_as(mean)
-        normal = Normal(mean, std)
-        if action is None:
-            raw_action = mean if deterministic else normal.rsample()
-            squashed = torch.tanh(raw_action)
-            action = self.action_low + self.action_scale * (squashed + 1.0)
-        else:
-            squashed = self._unscale_action(action)
-            raw_action = torch.atanh(squashed)
+        if self.action_space == "continuous":
+            mean = self.actor(obs)
+            if self.log_std is None:
+                raise RuntimeError("continuous policy is missing log_std.")
+            std = self.log_std.exp().expand_as(mean)
+            normal = Normal(mean, std)
+            if action is None:
+                raw_action = mean if deterministic else normal.rsample()
+                squashed = torch.tanh(raw_action)
+                action = self.action_low + self.action_scale * (squashed + 1.0)
+                action = self._project_action_norm(action)
+                squashed = self._unscale_action(action)
+                raw_action = torch.atanh(squashed)
+            else:
+                squashed = self._unscale_action(action)
+                raw_action = torch.atanh(squashed)
 
-        log_prob = normal.log_prob(raw_action)
-        log_prob -= torch.log(self.action_scale * (1.0 - squashed.pow(2)) + 1e-6)
-        entropy = normal.entropy().sum(dim=-1)
+            log_prob = normal.log_prob(raw_action)
+            log_prob -= torch.log(self.action_scale * (1.0 - squashed.pow(2)) + 1e-6)
+            entropy = normal.entropy().sum(dim=-1)
+            value = self.get_value(obs)
+            return action, log_prob.sum(dim=-1), entropy, value
+
+        logits = self.actor(obs)
+        categorical = Categorical(logits=logits)
+        if action is None:
+            action = logits.argmax(dim=-1) if deterministic else categorical.sample()
+        else:
+            action = action.long()
+            if action.ndim > 1:
+                action = action.squeeze(-1)
+        log_prob = categorical.log_prob(action)
+        entropy = categorical.entropy()
         value = self.get_value(obs)
-        return action, log_prob.sum(dim=-1), entropy, value
+        return action, log_prob, entropy, value
 
     def _unscale_action(self, action: torch.Tensor) -> torch.Tensor:
         squashed = (action - self.action_low) / self.action_scale - 1.0
         return torch.clamp(squashed, -0.999999, 0.999999)
+
+    def _project_action_norm(self, action: torch.Tensor) -> torch.Tensor:
+        if self.action_max_norm is None:
+            return action
+        norms = torch.linalg.vector_norm(action, dim=-1, keepdim=True)
+        scales = torch.clamp(self.action_max_norm / (norms + 1e-8), max=1.0)
+        return action * scales
 
 
 class PPOTrainer:
@@ -159,18 +199,41 @@ class PPOTrainer:
             env_runner=config.env_runner,
             mp_start_method=config.mp_start_method,
         )
-        self.obs, _ = self.runner.reset(seed=config.seed)
-        self.obs_rms = RunningMeanStd(self.obs.shape[1:])
-        self.obs_rms.update(self.obs)
+        try:
+            self.obs, _ = self.runner.reset(seed=config.seed)
+            self.obs_rms = RunningMeanStd(self.obs.shape[1:])
+            self.obs_rms.update(self.obs)
+        except BaseException:
+            self.runner.close()
+            raise
 
         action_low = np.asarray(self.runner.action_low, dtype=np.float32)
         action_high = np.asarray(self.runner.action_high, dtype=np.float32)
-        self.action_dim = action_low.shape[0]
+        self.action_space = str(getattr(self.runner, "action_space", "continuous"))
+        self.action_max_norm = getattr(self.runner, "action_max_norm", None)
+        if self.action_space == "continuous":
+            self.action_shape = tuple(action_low.shape)
+            self.action_dtype = np.float32
+            policy_action_dim = action_low.shape[0]
+            action_n = None
+        elif self.action_space == "discrete":
+            self.action_shape = ()
+            self.action_dtype = np.int64
+            action_n = getattr(self.runner, "action_n", None)
+            if action_n is None:
+                raise ValueError("discrete action space requires action_n.")
+            policy_action_dim = int(action_n)
+        else:
+            raise ValueError(f"Unsupported action_space: {self.action_space}")
+        self.action_n = action_n
+        self.action_dim = policy_action_dim
         self.model = ActorCritic(
             obs_dim=self.obs.shape[1],
-            action_dim=self.action_dim,
+            action_space=self.action_space,
+            action_dim=policy_action_dim,
             action_low=action_low,
             action_high=action_high,
+            action_max_norm=self.action_max_norm,
             hidden_sizes=config.hidden_sizes,
         ).to(self.device)
         self.optimizer = torch.optim.Adam(
@@ -195,13 +258,12 @@ class PPOTrainer:
         eval_seed: int | None = None,
     ) -> dict[str, float]:
         cfg = self.config
-        total_timesteps = cfg.total_timesteps if total_timesteps is None else total_timesteps
+        total_timesteps = (
+            cfg.total_timesteps if total_timesteps is None else total_timesteps
+        )
         if eval_interval is not None and eval_interval <= 0:
             eval_interval = None
-        if (
-            progress_interval_seconds is not None
-            and progress_interval_seconds <= 0
-        ):
+        if progress_interval_seconds is not None and progress_interval_seconds <= 0:
             progress_interval_seconds = None
         global_step = 0
         update_count = 0
@@ -363,7 +425,10 @@ class PPOTrainer:
                 obs_tensor,
                 deterministic=deterministic,
             )
-        return action.cpu().numpy()[0].astype(np.float32)
+        action_np = action.cpu().numpy()[0]
+        if self.action_space == "discrete":
+            return np.asarray(action_np, dtype=np.int64)
+        return np.asarray(action_np, dtype=np.float32)
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
@@ -375,12 +440,23 @@ class PPOTrainer:
                 "optimizer": self.optimizer.state_dict(),
                 "optimizer_step": self.optimizer_step,
                 "obs_rms": self.obs_rms.state_dict(),
+                "action_space": self.action_space,
+                "action_shape": self.action_shape,
+                "action_n": self.action_n,
+                "action_max_norm": self.action_max_norm,
             },
             path,
         )
 
     def load(self, path: str | Path) -> None:
         checkpoint = torch.load(path, map_location=self.device)
+        checkpoint_action_space = checkpoint.get("action_space", "continuous")
+        if checkpoint_action_space != self.action_space:
+            raise ValueError(
+                "Checkpoint action space "
+                f"{checkpoint_action_space!r} does not match trainer action space "
+                f"{self.action_space!r}."
+            )
         self.model.load_state_dict(checkpoint["model"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.optimizer_step = int(checkpoint.get("optimizer_step", 0))
@@ -430,10 +506,12 @@ class PPOTrainer:
         progress_interval_seconds: float | None,
     ) -> tuple[dict[str, torch.Tensor], RolloutStats]:
         cfg = self.config
-        obs_buf = np.zeros((cfg.rollout_steps, cfg.num_envs, self.obs.shape[1]), dtype=np.float32)
+        obs_buf = np.zeros(
+            (cfg.rollout_steps, cfg.num_envs, self.obs.shape[1]), dtype=np.float32
+        )
         action_buf = np.zeros(
-            (cfg.rollout_steps, cfg.num_envs, self.action_dim),
-            dtype=np.float32,
+            (cfg.rollout_steps, cfg.num_envs, *self.action_shape),
+            dtype=self.action_dtype,
         )
         logprob_buf = np.zeros((cfg.rollout_steps, cfg.num_envs), dtype=np.float32)
         reward_buf = np.zeros((cfg.rollout_steps, cfg.num_envs), dtype=np.float32)
@@ -488,7 +566,7 @@ class PPOTrainer:
             )
 
             phase_started_at = time.perf_counter()
-            actions = action.cpu().numpy().astype(np.float32)
+            actions = self._action_numpy(action)
             obs_buf[step_idx] = self.obs
             action_buf[step_idx] = actions
             logprob_buf[step_idx] = logprob.cpu().numpy()
@@ -588,7 +666,7 @@ class PPOTrainer:
         phase_started_at = time.perf_counter()
         rollout_tensors = {
             "obs": self._tensor(obs_buf.reshape(-1, self.obs.shape[1])),
-            "actions": self._tensor(action_buf.reshape(-1, self.action_dim)),
+            "actions": self._action_tensor(action_buf.reshape(-1, *self.action_shape)),
             "logprobs": self._tensor(logprob_buf.ravel()),
             "advantages": self._tensor(advantages.ravel()),
             "returns": self._tensor(returns.ravel()),
@@ -610,15 +688,9 @@ class PPOTrainer:
                 successes=rollout_successes,
                 wall_seconds=rollout_wall_seconds,
                 phase_wall_seconds=phase_wall_seconds,
-                worker_cpu_percent_sum=worker_cpu_summary[
-                    "worker_cpu_percent_sum"
-                ],
-                worker_cpu_percent_mean=worker_cpu_summary[
-                    "worker_cpu_percent_mean"
-                ],
-                worker_cpu_percent_max=worker_cpu_summary[
-                    "worker_cpu_percent_max"
-                ],
+                worker_cpu_percent_sum=worker_cpu_summary["worker_cpu_percent_sum"],
+                worker_cpu_percent_mean=worker_cpu_summary["worker_cpu_percent_mean"],
+                worker_cpu_percent_max=worker_cpu_summary["worker_cpu_percent_max"],
                 worker_count=int(worker_cpu_summary["worker_count"]),
             ),
         )
@@ -665,7 +737,9 @@ class PPOTrainer:
                     1.0 + cfg.clip_coef,
                 )
                 policy_loss = torch.max(policy_loss_1, policy_loss_2).mean()
-                value_loss = 0.5 * (new_value - rollout["returns"][indices]).pow(2).mean()
+                value_loss = (
+                    0.5 * (new_value - rollout["returns"][indices]).pow(2).mean()
+                )
                 entropy_loss = -entropy.mean()
                 loss = (
                     policy_loss
@@ -679,9 +753,7 @@ class PPOTrainer:
                 self.optimizer.step()
                 with torch.no_grad():
                     approx_kl = ((ratio - 1.0) - log_ratio).mean()
-                    clip_fraction = (
-                        (ratio - 1.0).abs() > cfg.clip_coef
-                    ).float().mean()
+                    clip_fraction = ((ratio - 1.0).abs() > cfg.clip_coef).float().mean()
                     step_metrics = self._optimizer_step_metrics(
                         loss=loss,
                         policy_loss=policy_loss,
@@ -720,7 +792,7 @@ class PPOTrainer:
             "train/clip_fraction": float(np.mean(clip_fractions)),
             "train/clip_range": float(cfg.clip_coef),
             "train/learning_rate": float(self.optimizer.param_groups[0]["lr"]),
-            "train/std": float(self.model.log_std.exp().mean().item()),
+            "train/std": self._policy_std_metric(),
             "train/optimizer_step": float(self.optimizer_step),
             "train/explained_variance": _explained_variance(
                 rollout["values"],
@@ -749,7 +821,7 @@ class PPOTrainer:
             "train/clip_fraction": float(clip_fraction.item()),
             "train/clip_range": float(self.config.clip_coef),
             "train/learning_rate": float(self.optimizer.param_groups[0]["lr"]),
-            "train/std": float(self.model.log_std.exp().mean().item()),
+            "train/std": self._policy_std_metric(),
             "train/explained_variance": _explained_variance(values, returns),
         }
 
@@ -866,8 +938,25 @@ class PPOTrainer:
             obs = self.obs_rms.normalize(obs)
         return self._tensor(obs)
 
+    def _action_numpy(self, action: torch.Tensor) -> np.ndarray:
+        if self.action_space == "discrete":
+            return action.cpu().numpy().astype(np.int64)
+        return action.cpu().numpy().astype(np.float32)
+
+    def _action_tensor(self, action: np.ndarray) -> torch.Tensor:
+        if self.action_space == "discrete":
+            return torch.as_tensor(action, dtype=torch.long, device=self.device)
+        return self._tensor(action)
+
     def _tensor(self, value: np.ndarray) -> torch.Tensor:
         return torch.as_tensor(value, dtype=torch.float32, device=self.device)
+
+    def _policy_std_metric(self) -> float:
+        if self.action_space != "continuous":
+            return 0.0
+        if self.model.log_std is None:
+            return 0.0
+        return float(self.model.log_std.exp().mean().item())
 
     def _synchronize_device(self) -> None:
         if self.device.type == "cuda":

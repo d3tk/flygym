@@ -4,17 +4,31 @@ from dataclasses import dataclass
 import multiprocessing as mp
 import os
 from pathlib import Path
+import signal
 import time
 import traceback
 from typing import Any, Callable
 
 import numpy as np
 
+_DEFAULT_RESPONSE_TIMEOUT_SECONDS = float(
+    os.environ.get("FLYGYM_SUBPROC_RESPONSE_TIMEOUT", "3600")
+)
+_POLL_INTERVAL_SECONDS = 0.1
+
+
+class SubprocWorkerError(RuntimeError):
+    """Raised when a subprocess environment worker exits or stops responding."""
+
 
 @dataclass(slots=True)
 class TaskRunnerSpec:
+    action_space: str
     action_low: np.ndarray
     action_high: np.ndarray
+    action_shape: tuple[int, ...]
+    action_n: int | None
+    action_max_norm: float | None
     observation_shape: tuple[int, ...]
     decision_steps: float
     decision_interval: float
@@ -33,6 +47,22 @@ class SyncTaskRunner:
     @property
     def action_high(self) -> np.ndarray:
         return self.spec.action_high
+
+    @property
+    def action_space(self) -> str:
+        return self.spec.action_space
+
+    @property
+    def action_shape(self) -> tuple[int, ...]:
+        return self.spec.action_shape
+
+    @property
+    def action_n(self) -> int | None:
+        return self.spec.action_n
+
+    @property
+    def action_max_norm(self) -> float | None:
+        return self.spec.action_max_norm
 
     @property
     def observation_shape(self) -> tuple[int, ...]:
@@ -89,8 +119,7 @@ class SyncTaskRunner:
 
     def diagnostics(self) -> list[dict[str, Any]]:
         return [
-            _task_diagnostics(task, rank=rank)
-            for rank, task in enumerate(self.tasks)
+            _task_diagnostics(task, rank=rank) for rank, task in enumerate(self.tasks)
         ]
 
 
@@ -101,8 +130,16 @@ class SubprocTaskRunner:
         num_envs: int,
         *,
         mp_start_method: str = "spawn",
+        response_timeout: float | None = None,
     ) -> None:
         self.num_envs = num_envs
+        self._response_timeout = (
+            _DEFAULT_RESPONSE_TIMEOUT_SECONDS
+            if response_timeout is None
+            else response_timeout
+        )
+        if self._response_timeout <= 0:
+            raise ValueError("response_timeout must be positive.")
         self._ctx = mp.get_context(mp_start_method)
         self._closed = False
         self._conns = []
@@ -133,6 +170,22 @@ class SubprocTaskRunner:
         return self.spec.action_high
 
     @property
+    def action_space(self) -> str:
+        return self.spec.action_space
+
+    @property
+    def action_shape(self) -> tuple[int, ...]:
+        return self.spec.action_shape
+
+    @property
+    def action_n(self) -> int | None:
+        return self.spec.action_n
+
+    @property
+    def action_max_norm(self) -> float | None:
+        return self.spec.action_max_norm
+
+    @property
     def observation_shape(self) -> tuple[int, ...]:
         return self.spec.observation_shape
 
@@ -158,7 +211,7 @@ class SubprocTaskRunner:
             return _empty_obs(self.observation_shape), []
         seeds = [None] * len(indices) if seeds is None else seeds
         for idx, seed in zip(indices, seeds, strict=True):
-            self._conns[idx].send(("reset", seed))
+            self._send_command(idx, ("reset", seed))
         results = [self._recv(idx) for idx in indices]
         obs, infos = zip(*results, strict=True)
         return np.stack(obs).astype(np.float32), list(infos)
@@ -167,8 +220,10 @@ class SubprocTaskRunner:
         self,
         actions: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[dict[str, Any]]]:
-        for conn, action in zip(self._conns, np.asarray(actions), strict=True):
-            conn.send(("step", np.asarray(action, dtype=np.float32)))
+        for idx, action in enumerate(np.asarray(actions)):
+            self._send_command(
+                idx, ("step", np.asarray(action, dtype=np.float32))
+            )
         results = [self._recv(idx) for idx in range(self.num_envs)]
         obs, rewards, terminated, truncated, infos = zip(*results, strict=True)
         return (
@@ -183,41 +238,92 @@ class SubprocTaskRunner:
         if self._closed:
             return
         self._closed = True
-        for conn in self._conns:
-            try:
-                conn.send(("close", None))
-            except (BrokenPipeError, EOFError):
-                pass
         for idx, conn in enumerate(self._conns):
-            try:
-                self._recv(idx)
-            except RuntimeError:
-                pass
-            conn.close()
-        for process in self._processes:
-            process.join(timeout=1.0)
+            process = self._processes[idx]
             if process.is_alive():
-                process.terminate()
-                process.join(timeout=1.0)
+                try:
+                    conn.send(("close", None))
+                except (BrokenPipeError, EOFError, OSError):
+                    pass
+        for idx, conn in enumerate(self._conns):
+            process = self._processes[idx]
+            if process.is_alive() and conn.poll(0):
+                try:
+                    self._recv(idx)
+                except (SubprocWorkerError, RuntimeError, EOFError):
+                    pass
+            try:
+                conn.close()
+            except OSError:
+                pass
+        self._reap_workers(join_timeout=0.2)
 
     def _request_specs(self) -> list[TaskRunnerSpec]:
-        for conn in self._conns:
-            conn.send(("spec", None))
+        for idx in range(self.num_envs):
+            self._send_command(idx, ("spec", None))
         return [self._recv(idx) for idx in range(self.num_envs)]
 
     def diagnostics(self) -> list[dict[str, Any]]:
-        for conn in self._conns:
-            conn.send(("diagnostics", None))
+        for idx in range(self.num_envs):
+            self._send_command(idx, ("diagnostics", None))
         return [self._recv(idx) for idx in range(self.num_envs)]
 
-    def _recv(self, idx: int):
+    def _send_command(self, idx: int, command: tuple[Any, Any]) -> None:
+        self._ensure_worker_alive(idx)
         try:
-            status, payload = self._conns[idx].recv()
-        except EOFError as exc:
-            raise RuntimeError(f"Worker {idx} closed unexpectedly.") from exc
+            self._conns[idx].send(command)
+        except (BrokenPipeError, EOFError, OSError) as exc:
+            self._raise_worker_failure(idx, exc)
+
+    def _recv(self, idx: int):
+        conn = self._conns[idx]
+        deadline = time.monotonic() + self._response_timeout
+        while not conn.poll(0):
+            self._ensure_worker_alive(idx)
+            if time.monotonic() >= deadline:
+                self._raise_worker_failure(
+                    idx,
+                    TimeoutError(
+                        f"no response within {self._response_timeout:g}s"
+                    ),
+                )
+            time.sleep(_POLL_INTERVAL_SECONDS)
+        try:
+            status, payload = conn.recv()
+        except (EOFError, ConnectionResetError, OSError) as exc:
+            self._raise_worker_failure(idx, exc)
         if status == "error":
-            raise RuntimeError(f"Worker {idx} failed:\n{payload}")
+            raise SubprocWorkerError(f"Worker {idx} failed:\n{payload}")
         return payload
+
+    def _ensure_worker_alive(self, idx: int) -> None:
+        if not self._processes[idx].is_alive():
+            self._raise_worker_failure(idx)
+
+    def _raise_worker_failure(
+        self,
+        idx: int,
+        cause: BaseException | None = None,
+    ) -> None:
+        message = (
+            f"Worker {idx} is not healthy ({_worker_status(self._processes[idx])})."
+        )
+        if cause is None:
+            raise SubprocWorkerError(message)
+        raise SubprocWorkerError(message) from cause
+
+    def _reap_workers(self, *, join_timeout: float) -> None:
+        for process in self._processes:
+            if not process.is_alive():
+                process.join(timeout=0)
+                continue
+            process.join(timeout=join_timeout)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=join_timeout)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=join_timeout)
 
 
 def make_task_runner(
@@ -240,7 +346,9 @@ def make_task_runner(
 
         config = getattr(task_factory, "config", None)
         if config is None:
-            raise TypeError("WarpNavigationTaskRunner requires a NavigationTaskFactory.")
+            raise TypeError(
+                "WarpNavigationTaskRunner requires a NavigationTaskFactory."
+            )
         return WarpNavigationTaskRunner(config, num_envs=num_envs)
     if env_device != "cpu":
         raise ValueError(f"Unsupported env_device: {env_device}")
@@ -298,8 +406,12 @@ def _task_worker(conn, task_factory: Callable[[], Any], rank: int) -> None:
 def _task_spec(task) -> TaskRunnerSpec:
     config = getattr(task, "config", None)
     return TaskRunnerSpec(
+        action_space=str(getattr(task, "action_space", "continuous")),
         action_low=np.asarray(task.action_low, dtype=np.float32),
         action_high=np.asarray(task.action_high, dtype=np.float32),
+        action_shape=tuple(getattr(task, "action_shape", task.action_low.shape)),
+        action_n=getattr(task, "action_n", None),
+        action_max_norm=getattr(task, "action_max_norm", None),
         observation_shape=tuple(getattr(task, "observation_shape", ())),
         decision_steps=float(getattr(config, "decision_steps", 1)),
         decision_interval=float(getattr(config, "decision_interval", 1.0)),
@@ -318,6 +430,8 @@ def _task_diagnostics(task, *, rank: int) -> dict[str, Any]:
         "rss_bytes": _process_rss_bytes(os.getpid()),
         "wall_time_seconds": time.time(),
         "observation_shape": tuple(getattr(task, "observation_shape", ())),
+        "action_space": str(getattr(task, "action_space", "continuous")),
+        "action_max_norm": getattr(task, "action_max_norm", None),
         "decision_steps": int(getattr(config, "decision_steps", 0)),
         "decision_interval": float(getattr(config, "decision_interval", 0.0)),
         "enable_vision": bool(getattr(config, "enable_vision", False)),
@@ -353,6 +467,23 @@ def _process_rss_bytes(pid: int) -> int | None:
         return int(statm[1]) * os.sysconf("SC_PAGE_SIZE")
     except (FileNotFoundError, IndexError, OSError, ValueError):
         return None
+
+
+def _worker_status(process: mp.Process) -> str:
+    if process.is_alive():
+        return "alive"
+    exitcode = process.exitcode
+    if exitcode is None:
+        return "not started"
+    if exitcode == 0:
+        return "exited cleanly"
+    if exitcode < 0:
+        try:
+            signal_name = signal.Signals(-exitcode).name
+        except (ValueError, AttributeError):
+            signal_name = str(-exitcode)
+        return f"killed by signal {signal_name} ({exitcode})"
+    return f"exited with code {exitcode}"
 
 
 def _indexed_seeds(seed: int | None, n: int) -> list[int | None]:

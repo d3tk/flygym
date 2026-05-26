@@ -9,13 +9,19 @@ from flygym_demo.odor_obstacle_navigation.ppo import (
 )
 from flygym_demo.odor_obstacle_navigation.runners import (
     SubprocTaskRunner,
+    SubprocWorkerError,
     SyncTaskRunner,
     TaskRunnerSpec,
 )
 from flygym_demo.odor_obstacle_navigation.task import (
+    ACTION_PRESET_NAMES,
+    ACTION_PRESET_VALUES,
+    ACTION_PRESETS,
+    ACTION_SPACES,
     NavigationTaskConfig,
     NavigationTaskFactory,
     OdorObstacleNavigationTask,
+    resolve_navigation_action,
 )
 from flygym_demo.odor_obstacle_navigation.world import (
     ObstacleOdorWorld,
@@ -24,6 +30,10 @@ from flygym_demo.odor_obstacle_navigation.world import (
 
 __all__ = [
     "ActorCritic",
+    "ACTION_PRESET_NAMES",
+    "ACTION_PRESET_VALUES",
+    "ACTION_PRESETS",
+    "ACTION_SPACES",
     "NavigationTaskConfig",
     "NavigationTaskFactory",
     "ObstacleOdorWorld",
@@ -33,7 +43,9 @@ __all__ = [
     "PPOTrainer",
     "RunningMeanStd",
     "SubprocTaskRunner",
+    "SubprocWorkerError",
     "SyncTaskRunner",
     "TaskRunnerSpec",
     "evaluation_metrics",
+    "resolve_navigation_action",
 ]

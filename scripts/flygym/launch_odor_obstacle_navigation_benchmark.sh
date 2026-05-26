@@ -2,8 +2,8 @@
 #SBATCH --job-name=flygym-v2-benchmark
 #SBATCH --partition=general
 #SBATCH --time=48:00:00
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=128G
+#SBATCH --cpus-per-task=128
+#SBATCH --mem=256G
 #SBATCH --gres=gpu:1
 #SBATCH --output=local_data/slurm/out/slurm-%x-%j.out
 #SBATCH --error=local_data/slurm/err/slurm-%x-%j.err
@@ -57,11 +57,13 @@ UPDATE_EPOCHS="10"
 ROLLOUTS="1"
 REPEATS="1"
 SUCCESS_BONUS="10.0"
-PROGRESS_REWARD_WEIGHT="10.0"
+PROGRESS_REWARD_WEIGHT="1.0"
+TIME_PENALTY="0.01"
 MP_START_METHOD="spawn"
-NUM_ENVS="16 30 45 60 64"
+# Each subprocess worker loads a full MuJoCo model; 128G is not enough beyond ~128 envs.
+NUM_ENVS="64 96 128"
 PPO_DEVICES="cpu cuda"
-ENV_DEVICES="cpu cuda"
+ENV_DEVICES="cpu"
 FEATURE_MODES="full"
 BENCHMARK_DIR="${REPO_ROOT}/outputs/odor_obstacle_navigation/benchmarks"
 OUTPUT_CSV="${BENCHMARK_DIR}/training_speed_${SLURM_JOB_ID:-local}.csv"
@@ -73,7 +75,7 @@ read -r -a FEATURE_MODE_ARGS <<< "${FEATURE_MODES}"
 
 mkdir -p "${BENCHMARK_DIR}"
 
-uv run python scripts/flygym/benchmark_odor_obstacle_navigation_training.py \
+uv run --extra warp python scripts/flygym/benchmark_odor_obstacle_navigation_training.py \
     --runners subproc \
     --ppo-devices "${PPO_DEVICES_ARGS[@]}" \
     --env-devices "${ENV_DEVICES_ARGS[@]}" \
@@ -91,5 +93,6 @@ uv run python scripts/flygym/benchmark_odor_obstacle_navigation_training.py \
     --target-radius 2.0 \
     --success-bonus "${SUCCESS_BONUS}" \
     --progress-reward-weight "${PROGRESS_REWARD_WEIGHT}" \
+    --time-penalty "${TIME_PENALTY}" \
     --output-csv "${OUTPUT_CSV}" \
     "$@"

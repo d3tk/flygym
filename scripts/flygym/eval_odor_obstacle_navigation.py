@@ -34,6 +34,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decision-steps", type=int, default=500)
     parser.add_argument("--episode-time", type=float, default=5.0)
     parser.add_argument("--target-radius", type=float, default=2.0)
+    parser.add_argument("--success-bonus", type=float, default=10.0)
+    parser.add_argument("--progress-reward-weight", type=float, default=1.0)
+    parser.add_argument("--time-penalty", type=float, default=0.01)
+    parser.add_argument(
+        "--action-space",
+        choices=["continuous", "discrete"],
+        default=None,
+        help="Defaults to the checkpoint action space when available.",
+    )
     parser.add_argument("--randomize-layout", action="store_true")
     parser.add_argument("--video-path", type=Path, default=None)
     parser.add_argument("--wandb", action="store_true")
@@ -63,11 +72,17 @@ def main() -> None:
     ppo_config.num_envs = 1
     ppo_config.device = args.device
     ppo_config.env_runner = "sync"
+    action_space = args.action_space or checkpoint.get("action_space", "continuous")
+    args.action_space = action_space
 
     task_config = NavigationTaskConfig(
         decision_steps=args.decision_steps,
         episode_time=args.episode_time,
         target_radius=args.target_radius,
+        success_bonus=args.success_bonus,
+        progress_reward_weight=args.progress_reward_weight,
+        time_penalty=args.time_penalty,
+        action_space=action_space,
         randomize_layout=args.randomize_layout,
         render=args.video_path is not None,
     )
@@ -141,6 +156,10 @@ def _log_wandb(args: argparse.Namespace, results: list[dict[str, float]]) -> Non
             "decision_steps": args.decision_steps,
             "episode_time": args.episode_time,
             "target_radius": args.target_radius,
+            "success_bonus": args.success_bonus,
+            "progress_reward_weight": args.progress_reward_weight,
+            "time_penalty": args.time_penalty,
+            "action_space": args.action_space,
             "randomize_layout": args.randomize_layout,
         },
     )

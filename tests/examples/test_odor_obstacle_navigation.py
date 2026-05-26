@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import signal
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -12,13 +15,16 @@ from flygym.anatomy import ContactBodiesPreset
 from flygym.utils.math import Rotation3D
 from flygym_demo.complex_terrain import make_locomotion_fly
 from flygym_demo.odor_obstacle_navigation.task import (
+    ACTION_PRESETS,
     NavigationTaskConfig,
     NavigationTaskFactory,
     OdorObstacleNavigationTask,
+    resolve_navigation_action,
 )
 from flygym_demo.odor_obstacle_navigation.world import ObstacleOdorWorld
 from flygym_demo.odor_obstacle_navigation.runners import (
     SubprocTaskRunner,
+    SubprocWorkerError,
     SyncTaskRunner,
 )
 
@@ -79,8 +85,10 @@ def test_progress_reward_sign():
 
         assert reward_closer > 0
         assert terms_closer["progress"] > 0
+        assert terms_closer["time"] == -task.config.time_penalty
         assert reward_farther < 0
         assert terms_farther["progress"] < 0
+        assert terms_farther["time"] == -task.config.time_penalty
     finally:
         task.close()
 
@@ -96,12 +104,51 @@ def test_success_terminates_episode():
         task.reset(seed=1)
         _, reward, terminated, truncated, info = task.step(np.array([0.0, 0.0]))
 
-        assert reward >= task.config.success_bonus
         assert terminated
         assert not truncated
         assert info["success"]
+        assert info["reward_terms"]["success"] == task.config.success_bonus
+        assert info["reward_terms"]["time"] == -task.config.time_penalty
+        assert reward == info["reward_terms"]["total"]
     finally:
         task.close()
+
+
+def test_discrete_actions_resolve_to_descending_drive_presets():
+    np.testing.assert_allclose(
+        resolve_navigation_action(0, action_space="discrete"),
+        ACTION_PRESETS["forward"],
+    )
+    np.testing.assert_allclose(
+        resolve_navigation_action(np.array(1), action_space="discrete"),
+        ACTION_PRESETS["left"],
+    )
+    np.testing.assert_allclose(
+        resolve_navigation_action(np.array([2]), action_space="discrete"),
+        ACTION_PRESETS["right"],
+    )
+
+
+def test_continuous_actions_are_positive_and_norm_limited():
+    action = resolve_navigation_action(
+        np.array([-1.0, 3.0], dtype=np.float32),
+        action_space="continuous",
+        action_low=np.array([1e-6, 1e-6], dtype=np.float32),
+        action_high=np.array([2.0, 2.0], dtype=np.float32),
+        action_max_norm=2.0,
+    )
+
+    assert np.all(action > 0)
+    assert np.linalg.norm(action) <= 2.0 + 1e-6
+
+    action = resolve_navigation_action(
+        np.array([2.0, 2.0], dtype=np.float32),
+        action_space="continuous",
+        action_low=np.array([1e-6, 1e-6], dtype=np.float32),
+        action_high=np.array([2.0, 2.0], dtype=np.float32),
+        action_max_norm=2.0,
+    )
+    np.testing.assert_allclose(np.linalg.norm(action), 2.0, rtol=1e-6)
 
 
 def test_time_limit_truncates_episode():
@@ -157,6 +204,19 @@ def test_short_real_rollout_runs():
         task.close()
 
 
+def test_short_real_discrete_rollout_runs():
+    task = OdorObstacleNavigationTask(_fast_config(action_space="discrete"))
+    try:
+        obs, _ = task.reset(seed=4)
+        for _ in range(2):
+            obs, _, terminated, truncated, _ = task.step(0)
+            assert np.all(np.isfinite(obs))
+            if terminated or truncated:
+                break
+    finally:
+        task.close()
+
+
 def test_sync_task_runner_batches_steps_and_resets():
     runner = SyncTaskRunner(StubNavigationTask, num_envs=2)
     try:
@@ -176,6 +236,25 @@ def test_sync_task_runner_batches_steps_and_resets():
         reset_obs, reset_infos = runner.reset_at([1], seeds=[20])
         assert reset_obs.shape == (1, 8)
         assert reset_infos[0]["seed"] == 20
+    finally:
+        runner.close()
+
+
+def test_subproc_task_runner_fails_fast_when_worker_is_killed():
+    class DieOnResetNavigationTask(StubNavigationTask):
+        def reset(self, seed: int | None = None):
+            os.kill(os.getpid(), signal.SIGKILL)
+
+    runner = SubprocTaskRunner(
+        DieOnResetNavigationTask,
+        num_envs=1,
+        mp_start_method="spawn",
+    )
+    try:
+        started_at = time.perf_counter()
+        with pytest.raises(SubprocWorkerError, match="Worker 0"):
+            runner.reset(seed=0)
+        assert time.perf_counter() - started_at < 2.0
     finally:
         runner.close()
 
@@ -258,6 +337,36 @@ def test_ppo_smoke_with_stub_task(env_runner: str, mp_start_method: str):
         trainer.close()
 
 
+def test_ppo_smoke_with_discrete_stub_task():
+    pytest.importorskip("torch")
+
+    from flygym_demo.odor_obstacle_navigation.ppo import PPOConfig, PPOTrainer
+
+    trainer = PPOTrainer(
+        StubDiscreteNavigationTask,
+        PPOConfig(
+            total_timesteps=8,
+            num_envs=2,
+            rollout_steps=4,
+            update_epochs=1,
+            minibatch_size=4,
+            hidden_sizes=(8,),
+            normalize_observations=False,
+            seed=0,
+            env_runner="sync",
+        ),
+    )
+    try:
+        metrics = trainer.train(eval_interval=None)
+        action = trainer.act(np.zeros(8, dtype=np.float32))
+
+        assert metrics["global_step"] >= 8
+        assert np.asarray(action).shape == ()
+        assert 0 <= int(action) < StubDiscreteNavigationTask.action_n
+    finally:
+        trainer.close()
+
+
 def test_subproc_real_task_short_rollout_runs():
     config = _fast_config(enable_olfaction=False)
     runner = SubprocTaskRunner(
@@ -303,6 +412,9 @@ class StubTaskConfig:
 
 class StubNavigationTask:
     observation_shape = (8,)
+    action_space = "continuous"
+    action_shape = (2,)
+    action_n = None
     action_low = np.array([-0.5, -0.5], dtype=np.float32)
     action_high = np.array([1.5, 1.5], dtype=np.float32)
     config = StubTaskConfig()
@@ -322,6 +434,47 @@ class StubNavigationTask:
         action = np.asarray(action, dtype=np.float32)
         obs = np.full(8, self.step_count / 10, dtype=np.float32)
         reward = float(1.0 - 0.1 * np.linalg.norm(action))
+        truncated = self.step_count >= 3
+        return (
+            obs,
+            reward,
+            False,
+            truncated,
+            {"success": False, "step_count": self.step_count},
+        )
+
+    def render(self):
+        return [None]
+
+    def close(self) -> None:
+        pass
+
+
+class StubDiscreteNavigationTask:
+    observation_shape = (8,)
+    action_space = "discrete"
+    action_shape = ()
+    action_n = 3
+    action_low = np.array([0], dtype=np.int64)
+    action_high = np.array([action_n - 1], dtype=np.int64)
+    config = StubTaskConfig()
+
+    def __init__(self) -> None:
+        self.step_count = 0
+
+    def reset(self, seed: int | None = None):
+        self.step_count = 0
+        obs = np.zeros(8, dtype=np.float32)
+        if seed is not None:
+            obs[0] = seed / 1000
+        return obs, {"seed": seed}
+
+    def step(self, action: np.ndarray):
+        self.step_count += 1
+        action = int(np.asarray(action).item())
+        obs = np.full(8, self.step_count / 10, dtype=np.float32)
+        obs[action] = 1.0
+        reward = float(action == 0)
         truncated = self.step_count >= 3
         return (
             obs,

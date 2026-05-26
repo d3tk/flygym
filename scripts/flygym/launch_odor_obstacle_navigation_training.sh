@@ -58,7 +58,9 @@ BATCH_SIZE=1200
 UPDATE_EPOCHS=10
 TOTAL_TIMESTEPS=1000000
 SUCCESS_BONUS=10.0
-PROGRESS_REWARD_WEIGHT=10.0
+PROGRESS_REWARD_WEIGHT=1.0
+TIME_PENALTY=0.01
+ACTION_SPACE="discrete"
 EVAL_INTERVAL=50000
 EVAL_EPISODES=5
 PROGRESS_INTERVAL_SECONDS=30
@@ -70,7 +72,7 @@ MP_START_METHOD="spawn"
 export WANDB_ENTITY="auto-fly"
 export WANDB_PROJECT="autonomous-drosophila"
 export WANDB_MODE="online"
-WANDB_RUN_NAME="obs_progress_dt005_continuous_success_bonus_${SUCCESS_BONUS}_${SLURM_JOB_ID:-local}"
+WANDB_RUN_NAME="obs_progress_dt005_${ACTION_SPACE}_success_bonus_${SUCCESS_BONUS}_shape_${SLURM_JOB_ID:-local}"
 RUN_DIR="${REPO_ROOT}/outputs/odor_obstacle_navigation/${WANDB_RUN_NAME}"
 
 uv run python scripts/flygym/train_odor_obstacle_navigation.py \
@@ -88,6 +90,8 @@ uv run python scripts/flygym/train_odor_obstacle_navigation.py \
     --target-radius 2.0 \
     --success-bonus "${SUCCESS_BONUS}" \
     --progress-reward-weight "${PROGRESS_REWARD_WEIGHT}" \
+    --time-penalty "${TIME_PENALTY}" \
+    --action-space "${ACTION_SPACE}" \
     --eval-interval "${EVAL_INTERVAL}" \
     --eval-episodes "${EVAL_EPISODES}" \
     --progress-interval-seconds "${PROGRESS_INTERVAL_SECONDS}" \

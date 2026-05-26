@@ -33,6 +33,7 @@ from flygym_demo.odor_obstacle_navigation import (  # noqa: E402
     PPOConfig,
     PPOTrainer,
 )
+from flygym_demo.odor_obstacle_navigation.runners import SubprocWorkerError  # noqa: E402
 
 FEATURE_MODES = {
     "full": (True, True),
@@ -132,7 +133,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-time", type=float, default=5.0)
     parser.add_argument("--target-radius", type=float, default=2.0)
     parser.add_argument("--success-bonus", type=float, default=10.0)
-    parser.add_argument("--progress-reward-weight", type=float, default=10.0)
+    parser.add_argument("--progress-reward-weight", type=float, default=1.0)
+    parser.add_argument("--time-penalty", type=float, default=0.01)
     parser.add_argument("--vision", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--olfaction", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -150,6 +152,14 @@ def parse_args() -> argparse.Namespace:
         "--output-csv",
         type=Path,
         default=Path("outputs/odor_obstacle_navigation/benchmarks/training_speed.csv"),
+    )
+    parser.add_argument(
+        "--continue-after-worker-failure",
+        action="store_true",
+        help=(
+            "Keep running larger num-envs sweeps after a subprocess worker dies. "
+            "By default the benchmark exits immediately."
+        ),
     )
     return parser.parse_args()
 
@@ -190,17 +200,29 @@ def main() -> None:
                         continue
                     for num_envs in args.num_envs:
                         for repeat in range(args.repeats):
-                            result = _run_trial(
-                                args,
-                                ppo_device,
-                                env_device,
-                                runner,
-                                feature_mode,
-                                vision,
-                                olfaction,
-                                num_envs,
-                                repeat,
-                            )
+                            try:
+                                result = _run_trial(
+                                    args,
+                                    ppo_device,
+                                    env_device,
+                                    runner,
+                                    feature_mode,
+                                    vision,
+                                    olfaction,
+                                    num_envs,
+                                    repeat,
+                                )
+                            except SubprocWorkerError as exc:
+                                print(
+                                    "Aborting benchmark after subprocess worker failure: "
+                                    f"ppo_device={ppo_device} env_device={env_device} "
+                                    f"runner={runner} features={feature_mode} "
+                                    f"num_envs={num_envs} repeat={repeat}: {exc}",
+                                    flush=True,
+                                )
+                                if not args.continue_after_worker_failure:
+                                    raise SystemExit(1) from exc
+                                continue
                             rows.append(result)
                             _print_trial(result)
                             _write_rows(args.output_csv, rows)
@@ -226,6 +248,7 @@ def _run_trial(
         target_radius=args.target_radius,
         success_bonus=args.success_bonus,
         progress_reward_weight=args.progress_reward_weight,
+        time_penalty=args.time_penalty,
         randomize_layout=args.randomize_layout,
         enable_vision=vision,
         enable_olfaction=olfaction,

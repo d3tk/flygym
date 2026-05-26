@@ -22,15 +22,28 @@ from flygym_demo.complex_terrain import (
 from flygym_demo.odor_obstacle_navigation.world import ObstacleOdorWorld
 
 
+ACTION_SPACES = ("continuous", "discrete")
+ACTION_PRESETS = {
+    "forward": np.array([1.0, 1.0], dtype=np.float32),
+    "left": np.array([0.8, 1.2], dtype=np.float32),
+    "right": np.array([1.2, 0.8], dtype=np.float32),
+}
+ACTION_PRESET_NAMES = tuple(ACTION_PRESETS)
+ACTION_PRESET_VALUES = np.stack(tuple(ACTION_PRESETS.values())).astype(np.float32)
+
+
 @dataclass(slots=True)
 class NavigationTaskConfig:
     timestep: float = 1e-4
     decision_steps: int = 500
     episode_time: float = 5.0
     target_radius: float = 2.0
-    progress_reward_weight: float = 10.0
-    success_bonus: float = 25.0
-    action_bounds: tuple[float, float] = (-0.5, 1.5)
+    progress_reward_weight: float = 1.0
+    time_penalty: float = 0.01
+    success_bonus: float = 10.0
+    action_space: str = "continuous"
+    action_bounds: tuple[float, float] = (1e-6, 1.8)
+    action_max_norm: float | None = 2.0
     spawn_position: np.ndarray = field(
         default_factory=lambda: np.array([0.0, 0.0, 0.8], dtype=float)
     )
@@ -83,18 +96,23 @@ class NavigationTaskConfig:
             raise ValueError("episode_time must be positive.")
         if self.target_radius <= 0:
             raise ValueError("target_radius must be positive.")
+        if self.time_penalty < 0:
+            raise ValueError("time_penalty must be non-negative.")
+        if self.action_space not in ACTION_SPACES:
+            raise ValueError(
+                f"action_space must be one of {ACTION_SPACES}; got {self.action_space!r}."
+            )
         if self.action_bounds[0] >= self.action_bounds[1]:
             raise ValueError("action_bounds must be ordered as (low, high).")
+        if self.action_max_norm is not None and self.action_max_norm <= 0:
+            raise ValueError("action_max_norm must be positive or None.")
         if self.spawn_position.shape != (3,):
             raise ValueError("spawn_position must have shape (3,).")
         if self.odor_source.shape != (1, 3):
             raise ValueError("odor_source must have shape (1, 3).")
         if self.peak_odor_intensity.ndim != 2 or self.peak_odor_intensity.shape[0] != 1:
             raise ValueError("peak_odor_intensity must have shape (1, odor_dims).")
-        if (
-            self.obstacle_positions.ndim != 2
-            or self.obstacle_positions.shape[1] != 2
-        ):
+        if self.obstacle_positions.ndim != 2 or self.obstacle_positions.shape[1] != 2:
             raise ValueError("obstacle_positions must have shape (n_obstacles, 2).")
         if self.warmup_seconds < 0:
             raise ValueError("warmup_seconds must be non-negative.")
@@ -121,8 +139,21 @@ class OdorObstacleNavigationTask:
 
     def __init__(self, config: NavigationTaskConfig | None = None) -> None:
         self.config = config or NavigationTaskConfig()
-        self.action_low = np.full(2, self.config.action_bounds[0], dtype=np.float32)
-        self.action_high = np.full(2, self.config.action_bounds[1], dtype=np.float32)
+        self.action_space = self.config.action_space
+        if self.action_space == "continuous":
+            self.action_shape = (2,)
+            self.action_n = None
+            self.action_low = np.full(2, self.config.action_bounds[0], dtype=np.float32)
+            self.action_high = np.full(
+                2, self.config.action_bounds[1], dtype=np.float32
+            )
+            self.action_max_norm = self.config.action_max_norm
+        else:
+            self.action_shape = ()
+            self.action_n = len(ACTION_PRESET_NAMES)
+            self.action_low = np.array([0], dtype=np.int64)
+            self.action_high = np.array([self.action_n - 1], dtype=np.int64)
+            self.action_max_norm = None
         self._base_spawn_position = self.config.spawn_position.copy()
         self._base_spawn_yaw = float(self.config.spawn_yaw)
         self._base_odor_source = self.config.odor_source.copy()
@@ -157,7 +188,9 @@ class OdorObstacleNavigationTask:
             self.renderer = None
         self.controller = HybridTurningController(
             timestep=self.config.timestep,
-            output_dof_order=self.fly.get_actuated_jointdofs_order(ActuatorType.POSITION),
+            output_dof_order=self.fly.get_actuated_jointdofs_order(
+                ActuatorType.POSITION
+            ),
         )
         self._root_qposadr, self._root_qveladr = self._find_root_addresses()
         self._odor_marker_body_ids = self._cache_body_ids(
@@ -211,13 +244,18 @@ class OdorObstacleNavigationTask:
     def step(
         self, action: np.ndarray
     ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
-        action = np.asarray(action, dtype=np.float32)
-        if action.shape != (2,):
-            raise ValueError("action must have shape (2,).")
-        action = np.clip(action, self.action_low, self.action_high)
+        descending_signal = resolve_navigation_action(
+            action,
+            action_space=self.action_space,
+            action_low=self.action_low,
+            action_high=self.action_high,
+            action_max_norm=self.action_max_norm,
+        )
 
         for _ in range(self.config.decision_steps):
-            locomotion_action = self.controller.step(action, self.sim, self.fly.name)
+            locomotion_action = self.controller.step(
+                descending_signal, self.sim, self.fly.name
+            )
             apply_locomotion_action(self.sim, self.fly.name, locomotion_action)
             self.sim.step()
 
@@ -489,6 +527,7 @@ class OdorObstacleNavigationTask:
         progress = previous_distance - distance_to_target
         terms = {
             "progress": self.config.progress_reward_weight * progress,
+            "time": -self.config.time_penalty,
             "success": self.config.success_bonus if success else 0.0,
         }
         reward = float(sum(terms.values()))
@@ -518,7 +557,9 @@ class OdorObstacleNavigationTask:
             if self.sim.mj_model.jnt_type[joint_id] == mj.mjtJoint.mjJNT_FREE
         ]
         if len(free_joint_ids) != 1:
-            raise RuntimeError("Expected exactly one free joint for the navigation fly.")
+            raise RuntimeError(
+                "Expected exactly one free joint for the navigation fly."
+            )
         joint_id = free_joint_ids[0]
         return (
             int(self.sim.mj_model.jnt_qposadr[joint_id]),
@@ -541,6 +582,58 @@ class OdorObstacleNavigationTask:
 def _yaw_to_quat_wxyz(yaw: float) -> tuple[float, float, float, float]:
     half_yaw = yaw / 2
     return (math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw))
+
+
+def resolve_navigation_action(
+    action: Any,
+    *,
+    action_space: str,
+    action_low: np.ndarray | None = None,
+    action_high: np.ndarray | None = None,
+    action_max_norm: float | None = None,
+) -> np.ndarray:
+    if action_space == "continuous":
+        action_array = np.asarray(action, dtype=np.float32)
+        if action_array.shape != (2,):
+            raise ValueError("continuous action must have shape (2,).")
+        if action_low is not None and action_high is not None:
+            action_array = np.clip(action_array, action_low, action_high)
+        return _project_action_norm(action_array, action_max_norm)
+
+    if action_space != "discrete":
+        raise ValueError(
+            f"action_space must be one of {ACTION_SPACES}; got {action_space!r}."
+        )
+
+    action_array = np.asarray(action)
+    if action_array.shape == (1,):
+        action_value = action_array[0]
+    elif action_array.shape == ():
+        action_value = action_array.item()
+    else:
+        raise ValueError("discrete action must be a scalar integer index.")
+    if (
+        isinstance(action_value, (float, np.floating))
+        and not float(action_value).is_integer()
+    ):
+        raise ValueError("discrete action must be an integer index.")
+    action_idx = int(action_value)
+    if action_idx < 0 or action_idx >= len(ACTION_PRESET_VALUES):
+        raise ValueError(
+            f"discrete action index must be in [0, {len(ACTION_PRESET_VALUES) - 1}]."
+        )
+    return ACTION_PRESET_VALUES[action_idx].copy()
+
+
+def _project_action_norm(
+    action: np.ndarray, action_max_norm: float | None
+) -> np.ndarray:
+    if action_max_norm is None:
+        return action
+    norm = float(np.linalg.norm(action))
+    if norm <= action_max_norm or norm == 0.0:
+        return action
+    return (action * (action_max_norm / norm)).astype(np.float32)
 
 
 def _compute_ommatidia_coms(retina: Retina) -> np.ndarray:

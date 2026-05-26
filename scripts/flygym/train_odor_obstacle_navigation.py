@@ -59,10 +59,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decision-steps", type=int, default=500)
     parser.add_argument("--episode-time", type=float, default=5.0)
     parser.add_argument("--target-radius", type=float, default=2.0)
-    parser.add_argument("--success-bonus", type=float, default=25.0)
-    parser.add_argument("--progress-reward-weight", type=float, default=10.0)
+    parser.add_argument("--success-bonus", type=float, default=10.0)
+    parser.add_argument("--progress-reward-weight", type=float, default=1.0)
+    parser.add_argument("--time-penalty", type=float, default=0.01)
+    parser.add_argument(
+        "--action-space",
+        choices=["continuous", "discrete"],
+        default="continuous",
+    )
     parser.add_argument("--vision", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--olfaction", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--olfaction", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--randomize-layout", action="store_true")
     parser.add_argument(
         "--run-dir",
@@ -100,6 +108,8 @@ def main() -> None:
         target_radius=args.target_radius,
         success_bonus=args.success_bonus,
         progress_reward_weight=args.progress_reward_weight,
+        time_penalty=args.time_penalty,
+        action_space=args.action_space,
         enable_vision=args.vision,
         enable_olfaction=args.olfaction,
         randomize_layout=args.randomize_layout,
@@ -134,6 +144,10 @@ def main() -> None:
         f"rollout_steps={args.rollout_steps} "
         f"decision_steps={args.decision_steps} "
         f"decision_interval={task_config.decision_interval:.6f}s "
+        f"reward=w_progress:{task_config.progress_reward_weight:g} "
+        f"time_penalty:{task_config.time_penalty:g} "
+        f"success_bonus:{task_config.success_bonus:g} "
+        f"action_space={args.action_space} "
         f"env_device={args.env_device} "
         f"env_runner={args.env_runner} "
         f"wandb={'off' if args.no_wandb else args.wandb_mode}",
@@ -149,21 +163,16 @@ def main() -> None:
     with worker_diagnostics_path.open("w", encoding="utf-8") as f:
         json.dump(trainer.diagnostics(), f, indent=2)
     print(
-        "[train] "
-        f"worker diagnostics written to {worker_diagnostics_path}",
+        f"[train] worker diagnostics written to {worker_diagnostics_path}",
         flush=True,
     )
     try:
         metrics = trainer.train(
             metrics_callback=(
-                None
-                if wandb_run is None
-                else lambda values: wandb_run.log(values)
+                None if wandb_run is None else lambda values: wandb_run.log(values)
             ),
             progress_callback=(
-                None
-                if args.progress_interval_seconds <= 0
-                else _print_progress
+                None if args.progress_interval_seconds <= 0 else _print_progress
             ),
             progress_interval_seconds=args.progress_interval_seconds,
             eval_interval=args.eval_interval,
@@ -196,6 +205,10 @@ def _json_ready(
             "target_radius": task_config.target_radius,
             "success_bonus": task_config.success_bonus,
             "progress_reward_weight": task_config.progress_reward_weight,
+            "time_penalty": task_config.time_penalty,
+            "action_space": task_config.action_space,
+            "action_bounds": list(task_config.action_bounds),
+            "action_max_norm": task_config.action_max_norm,
             "enable_vision": task_config.enable_vision,
             "enable_olfaction": task_config.enable_olfaction,
             "randomize_layout": task_config.randomize_layout,
