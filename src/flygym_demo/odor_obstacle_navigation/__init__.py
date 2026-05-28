@@ -1,11 +1,10 @@
 """V2-native odor-source navigation with obstacles."""
 
 from flygym_demo.odor_obstacle_navigation.ppo import (
-    ActorCritic,
+    NavigationVecEnv,
     PPOConfig,
-    PPOTrainer,
-    RunningMeanStd,
     evaluation_metrics,
+    make_navigation_vec_env,
 )
 from flygym_demo.odor_obstacle_navigation.runners import (
     SubprocTaskRunner,
@@ -29,7 +28,6 @@ from flygym_demo.odor_obstacle_navigation.world import (
 )
 
 __all__ = [
-    "ActorCritic",
     "ACTION_PRESET_NAMES",
     "ACTION_PRESET_VALUES",
     "ACTION_PRESETS",
@@ -39,13 +37,13 @@ __all__ = [
     "ObstacleOdorWorld",
     "ObstacleOdorWorldConfig",
     "OdorObstacleNavigationTask",
+    "NavigationVecEnv",
     "PPOConfig",
-    "PPOTrainer",
-    "RunningMeanStd",
     "SubprocTaskRunner",
     "SubprocWorkerError",
     "SyncTaskRunner",
     "TaskRunnerSpec",
     "evaluation_metrics",
+    "make_navigation_vec_env",
     "resolve_navigation_action",
 ]

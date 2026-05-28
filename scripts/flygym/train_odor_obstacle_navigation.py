@@ -6,6 +6,10 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
+
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = REPO_ROOT / "src"
@@ -15,14 +19,16 @@ if str(SRC_DIR) not in sys.path:
 from flygym_demo.odor_obstacle_navigation import (  # noqa: E402
     NavigationTaskConfig,
     NavigationTaskFactory,
+    OdorObstacleNavigationTask,
     PPOConfig,
-    PPOTrainer,
+    evaluation_metrics,
+    make_navigation_vec_env,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a native PPO policy for odor obstacle navigation."
+        description="Train an SB3 PPO policy for odor obstacle navigation."
     )
     parser.add_argument("--total-timesteps", type=int, default=100_000)
     parser.add_argument("--num-envs", type=int, default=4)
@@ -32,8 +38,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
+    parser.add_argument("--clip-coef", type=float, default=0.2)
     parser.add_argument("--entropy-coef", type=float, default=0.0)
     parser.add_argument("--value-coef", type=float, default=0.5)
+    parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--eval-interval", type=int, default=10_000)
     parser.add_argument("--eval-episodes", type=int, default=5)
     parser.add_argument("--progress-interval-seconds", type=float, default=30.0)
@@ -56,6 +64,11 @@ def parse_args() -> argparse.Namespace:
         default="spawn",
     )
     parser.add_argument("--timestep", type=float, default=1e-4)
+    parser.add_argument(
+        "--ccd-iterations",
+        type=int,
+        default=NavigationTaskConfig().ccd_iterations,
+    )
     parser.add_argument("--decision-steps", type=int, default=500)
     parser.add_argument("--episode-time", type=float, default=5.0)
     parser.add_argument("--target-radius", type=float, default=2.0)
@@ -103,6 +116,7 @@ def main() -> None:
         raise ValueError("eval_episodes must be positive.")
     task_config = NavigationTaskConfig(
         timestep=args.timestep,
+        ccd_iterations=args.ccd_iterations,
         decision_steps=args.decision_steps,
         episode_time=args.episode_time,
         target_radius=args.target_radius,
@@ -124,8 +138,10 @@ def main() -> None:
         gamma=args.gamma,
         gae_lambda=args.gae_lambda,
         learning_rate=args.learning_rate,
+        clip_coef=args.clip_coef,
         entropy_coef=args.entropy_coef,
         value_coef=args.value_coef,
+        max_grad_norm=args.max_grad_norm,
         seed=args.seed,
         device=args.device,
         env_device=args.env_device,
@@ -137,12 +153,160 @@ def main() -> None:
     with (args.run_dir / "config.json").open("w", encoding="utf-8") as f:
         json.dump(run_config, f, indent=2)
 
+    print(_training_summary(args, task_config), flush=True)
+    wandb_run = _init_wandb(args, run_config)
+    env = make_navigation_vec_env(NavigationTaskFactory(deepcopy(task_config)), ppo_config)
+    worker_diagnostics_path = args.run_dir / "worker_diagnostics.json"
+    with worker_diagnostics_path.open("w", encoding="utf-8") as f:
+        json.dump(env.diagnostics(), f, indent=2)
     print(
+        f"[train] worker diagnostics written to {worker_diagnostics_path}",
+        flush=True,
+    )
+
+    callback = _TrainingCallback(
+        task_config=task_config,
+        eval_interval=args.eval_interval,
+        eval_episodes=args.eval_episodes,
+        eval_seed=args.seed + 100_000,
+        progress_interval_seconds=args.progress_interval_seconds,
+        wandb_run=wandb_run,
+    )
+    started_at = time.perf_counter()
+    try:
+        model = PPO("MlpPolicy", env, **ppo_config.sb3_kwargs())
+        model.learn(total_timesteps=ppo_config.total_timesteps, callback=callback)
+        model.save(args.run_dir / "policy.zip")
+    finally:
+        env.close()
+        if wandb_run is not None:
+            wandb_run.finish()
+    metrics = {
+        "global_step": float(ppo_config.total_timesteps),
+        "time/wall_seconds": time.perf_counter() - started_at,
+        **callback.last_metrics,
+    }
+    print(json.dumps(metrics, indent=2))
+
+
+class _TrainingCallback(BaseCallback):
+    def __init__(
+        self,
+        *,
+        task_config: NavigationTaskConfig,
+        eval_interval: int | None,
+        eval_episodes: int,
+        eval_seed: int,
+        progress_interval_seconds: float,
+        wandb_run,
+    ) -> None:
+        super().__init__()
+        self.task_config = task_config
+        self.eval_interval = None if eval_interval is None or eval_interval <= 0 else eval_interval
+        self.eval_episodes = eval_episodes
+        self.eval_seed = eval_seed
+        self.progress_interval_seconds = progress_interval_seconds
+        self.wandb_run = wandb_run
+        self.last_metrics: dict[str, float] = {}
+        self._started_at = 0.0
+        self._next_progress_at = 0.0
+        self._next_eval_step = self.eval_interval
+
+    def _on_training_start(self) -> None:
+        self._started_at = time.perf_counter()
+        self._next_progress_at = self._started_at + self.progress_interval_seconds
+
+    def _on_step(self) -> bool:
+        now = time.perf_counter()
+        if self.progress_interval_seconds > 0 and now >= self._next_progress_at:
+            elapsed = now - self._started_at
+            metrics = {
+                "global_step": float(self.num_timesteps),
+                "time/wall_seconds": elapsed,
+                "time/fps": float(self.num_timesteps / elapsed) if elapsed > 0 else 0.0,
+            }
+            self._log(metrics)
+            print(
+                "[train] "
+                f"global_step={self.num_timesteps} "
+                f"elapsed={elapsed:.1f}s "
+                f"decisions/s={metrics['time/fps']:.2f}",
+                flush=True,
+            )
+            self._next_progress_at = now + self.progress_interval_seconds
+
+        while self._next_eval_step is not None and self.num_timesteps >= self._next_eval_step:
+            metrics = evaluation_metrics(
+                _evaluate_model(
+                    self.model,
+                    self.task_config,
+                    episodes=self.eval_episodes,
+                    seed=self.eval_seed + self.num_timesteps,
+                )
+            )
+            metrics["global_step"] = float(self.num_timesteps)
+            self.last_metrics = metrics
+            self._log(metrics)
+            print(
+                "[train] "
+                f"eval global_step={self.num_timesteps} "
+                f"success={metrics['eval/success_rate']:.1f}% "
+                f"reward={metrics['eval/mean_reward']:.3f} "
+                f"len={metrics['eval/mean_ep_length']:.1f}",
+                flush=True,
+            )
+            self._next_eval_step += self.eval_interval
+        return True
+
+    def _log(self, metrics: dict[str, float]) -> None:
+        if self.wandb_run is not None:
+            self.wandb_run.log(metrics)
+
+
+def _evaluate_model(
+    model: PPO,
+    task_config: NavigationTaskConfig,
+    *,
+    episodes: int,
+    seed: int,
+) -> list[dict[str, float]]:
+    results = []
+    for episode_idx in range(episodes):
+        task = OdorObstacleNavigationTask(deepcopy(task_config))
+        try:
+            obs, info = task.reset(seed=seed + episode_idx)
+            done = False
+            total_reward = 0.0
+            steps = 0
+            while not done:
+                action, _ = model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, info = task.step(action)
+                total_reward += reward
+                steps += 1
+                done = terminated or truncated
+            results.append(
+                {
+                    "return": float(total_reward),
+                    "steps": float(steps),
+                    "success": float(bool(info.get("success", False))),
+                }
+            )
+        finally:
+            task.close()
+    return results
+
+
+def _training_summary(
+    args: argparse.Namespace,
+    task_config: NavigationTaskConfig,
+) -> str:
+    return (
         "[train] "
         f"run_dir={args.run_dir} "
         f"num_envs={args.num_envs} "
         f"rollout_steps={args.rollout_steps} "
         f"decision_steps={args.decision_steps} "
+        f"ccd_iterations={args.ccd_iterations} "
         f"decision_interval={task_config.decision_interval:.6f}s "
         f"reward=w_progress:{task_config.progress_reward_weight:g} "
         f"time_penalty:{task_config.time_penalty:g} "
@@ -150,41 +314,8 @@ def main() -> None:
         f"action_space={args.action_space} "
         f"env_device={args.env_device} "
         f"env_runner={args.env_runner} "
-        f"wandb={'off' if args.no_wandb else args.wandb_mode}",
-        flush=True,
+        f"wandb={'off' if args.no_wandb else args.wandb_mode}"
     )
-    task_factory = NavigationTaskFactory(deepcopy(task_config))
-    wandb_run = _init_wandb(args, run_config)
-    trainer = PPOTrainer(
-        task_factory,
-        ppo_config,
-    )
-    worker_diagnostics_path = args.run_dir / "worker_diagnostics.json"
-    with worker_diagnostics_path.open("w", encoding="utf-8") as f:
-        json.dump(trainer.diagnostics(), f, indent=2)
-    print(
-        f"[train] worker diagnostics written to {worker_diagnostics_path}",
-        flush=True,
-    )
-    try:
-        metrics = trainer.train(
-            metrics_callback=(
-                None if wandb_run is None else lambda values: wandb_run.log(values)
-            ),
-            progress_callback=(
-                None if args.progress_interval_seconds <= 0 else _print_progress
-            ),
-            progress_interval_seconds=args.progress_interval_seconds,
-            eval_interval=args.eval_interval,
-            eval_episodes=args.eval_episodes,
-            eval_seed=args.seed + 100_000,
-        )
-        trainer.save(args.run_dir / "policy.pt")
-    finally:
-        trainer.close()
-        if wandb_run is not None:
-            wandb_run.finish()
-    print(json.dumps(metrics, indent=2))
 
 
 def _json_ready(
@@ -221,7 +352,14 @@ def _json_ready(
             "rollout_steps": ppo_config.rollout_steps,
             "update_epochs": ppo_config.update_epochs,
             "minibatch_size": ppo_config.minibatch_size,
+            "gamma": ppo_config.gamma,
+            "gae_lambda": ppo_config.gae_lambda,
             "learning_rate": ppo_config.learning_rate,
+            "clip_coef": ppo_config.clip_coef,
+            "entropy_coef": ppo_config.entropy_coef,
+            "value_coef": ppo_config.value_coef,
+            "max_grad_norm": ppo_config.max_grad_norm,
+            "hidden_sizes": list(ppo_config.hidden_sizes),
             "seed": ppo_config.seed,
             "device": ppo_config.device,
             "env_device": ppo_config.env_device,
@@ -257,85 +395,9 @@ def _init_wandb(args: argparse.Namespace, run_config: dict):
         config=run_config,
     )
     wandb.define_metric("global_step")
-    wandb.define_metric("train/optimizer_step")
-    wandb.define_metric("train/*", step_metric="train/optimizer_step")
-    wandb.define_metric("rollout/*", step_metric="global_step")
     wandb.define_metric("eval/*", step_metric="global_step")
     wandb.define_metric("time/*", step_metric="global_step")
-    wandb.define_metric("speed/*", step_metric="global_step")
     return run
-
-
-def _print_progress(event: dict) -> None:
-    stage = event["stage"]
-    if stage == "rollout_start":
-        print(
-            "[train] "
-            f"rollout={int(event['rollout_index'])} start "
-            f"global_step={int(event['global_step'])} "
-            f"steps={int(event['rollout_steps'])} "
-            f"num_envs={int(event['num_envs'])} "
-            f"decision_interval={event['decision_interval']:.6f}s",
-            flush=True,
-        )
-    elif stage in {"rollout", "rollout_end"}:
-        phase_text = ""
-        if stage == "rollout_end":
-            phase_text = (
-                f" env_step={event.get('phase_env_step_wall_seconds', 0.0):.1f}s"
-                f" policy={event.get('phase_policy_forward_wall_seconds', 0.0):.1f}s"
-                f" transfer={event.get('phase_action_transfer_wall_seconds', 0.0):.1f}s"
-                f" reset={event.get('phase_reset_wall_seconds', 0.0):.1f}s"
-                f" worker_cpu_sum={event.get('worker_cpu_percent_sum', 0.0) or 0.0:.1f}%"
-            )
-        print(
-            "[train] "
-            f"rollout={int(event['rollout_index'])} "
-            f"{int(event['rollout_step'])}/{int(event['rollout_steps'])} "
-            f"global_step={int(event['global_step'])} "
-            f"elapsed={event['rollout_wall_seconds']:.1f}s "
-            f"decisions/s={event['rollout_timesteps_per_sec']:.2f} "
-            f"substeps/s={event['simulator_substeps_per_sec']:.0f} "
-            f"sim_s/s={event['simulated_seconds_per_sec']:.3f} "
-            f"episodes={int(event['episodes_completed'])}"
-            f"{phase_text}",
-            flush=True,
-        )
-    elif stage == "update_start":
-        print(
-            "[train] "
-            f"rollout={int(event['rollout_index'])} update start "
-            f"global_step={int(event['global_step'])}",
-            flush=True,
-        )
-    elif stage == "update_end":
-        print(
-            "[train] "
-            f"rollout={int(event['rollout_index'])} update done "
-            f"elapsed={event['update_wall_seconds']:.1f}s "
-            f"loss={event['train/loss']:.4g} "
-            f"value_loss={event['train/value_loss']:.4g} "
-            f"approx_kl={event['train/approx_kl']:.4g}",
-            flush=True,
-        )
-    elif stage == "eval_start":
-        print(
-            "[train] "
-            f"eval start global_step={int(event['global_step'])} "
-            f"episodes={int(event['eval_episodes'])}",
-            flush=True,
-        )
-    elif stage == "eval_end":
-        print(
-            "[train] "
-            f"eval done elapsed={event['eval_wall_seconds']:.1f}s "
-            f"success={event['eval/success_rate']:.1f}% "
-            f"reward={event['eval/mean_reward']:.3f} "
-            f"len={event['eval/mean_ep_length']:.1f}",
-            flush=True,
-        )
-    else:
-        print(f"[train] {stage}", flush=True)
 
 
 if __name__ == "__main__":

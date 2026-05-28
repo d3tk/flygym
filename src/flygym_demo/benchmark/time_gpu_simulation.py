@@ -1,9 +1,14 @@
+from __future__ import annotations
+
 from time import perf_counter_ns
 
 import numpy as np
 import warp as wp
-import pandas as pd
 from loguru import logger
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
 
 from flygym.warp import GPUSimulation
 from flygym.compose import (
@@ -119,7 +124,7 @@ def run_simulation(
     assert sim.mj_model.opt.timestep == timestep
 
     if enable_rendering:
-        renderer = sim.set_renderer(
+        sim.set_renderer(
             cam,
             playback_speed=0.2,
             output_fps=25,
@@ -165,6 +170,8 @@ def run_benchmark(
     sim_steps: int,
     simplify_geom: bool,
 ) -> pd.DataFrame:
+    if pd is None:
+        raise RuntimeError("pandas is required for run_benchmark().")
     ref_fly, *_ = make_model()
     jointdofs_order = ref_fly.get_actuated_jointdofs_order(ActuatorType.POSITION)
     replay_data = ReplayTargetData(sim_timestep, jointdofs_order)

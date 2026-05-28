@@ -37,7 +37,10 @@ if [[ -z "${REPO_ROOT:-}" ]]; then
 fi
 cd "${REPO_ROOT}"
 
-uv sync --frozen --extra warp
+# shellcheck source=ensure_cuda_venv.sh
+source "${SCRIPT_DIR}/ensure_cuda_venv.sh"
+ensure_cuda_venv "${REPO_ROOT}"
+verify_cuda_runtime "${REPO_ROOT}"
 
 export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
 export MUJOCO_GL="egl"
@@ -50,6 +53,7 @@ export VECLIB_MAXIMUM_THREADS=1
 
 TIMESTEP="0.0001"
 DECISION_STEPS="500"
+CCD_ITERATIONS="300"
 EPISODE_TIME_SECONDS="5"
 ROLLOUT_STEPS="200"
 BATCH_SIZE="1200"
@@ -60,11 +64,11 @@ SUCCESS_BONUS="10.0"
 PROGRESS_REWARD_WEIGHT="1.0"
 TIME_PENALTY="0.01"
 MP_START_METHOD="spawn"
-# Each subprocess worker loads a full MuJoCo model; 128G is not enough beyond ~128 envs.
-NUM_ENVS="64 96 128"
+NUM_ENVS="64 72 96 128 160 256 320 384"
 PPO_DEVICES="cpu cuda"
-ENV_DEVICES="cpu"
+ENV_DEVICES="cuda"
 FEATURE_MODES="full"
+BENCHMARK_LAYERS="env"
 BENCHMARK_DIR="${REPO_ROOT}/outputs/odor_obstacle_navigation/benchmarks"
 OUTPUT_CSV="${BENCHMARK_DIR}/training_speed_${SLURM_JOB_ID:-local}.csv"
 
@@ -72,6 +76,8 @@ read -r -a NUM_ENVS_ARGS <<< "${NUM_ENVS}"
 read -r -a PPO_DEVICES_ARGS <<< "${PPO_DEVICES}"
 read -r -a ENV_DEVICES_ARGS <<< "${ENV_DEVICES}"
 read -r -a FEATURE_MODE_ARGS <<< "${FEATURE_MODES}"
+read -r -a BENCHMARK_LAYER_ARGS <<< "${BENCHMARK_LAYERS}"
+read -r -a CCD_ITERATION_ARGS <<< "${CCD_ITERATIONS}"
 
 mkdir -p "${BENCHMARK_DIR}"
 
@@ -81,6 +87,8 @@ uv run --extra warp python scripts/flygym/benchmark_odor_obstacle_navigation_tra
     --env-devices "${ENV_DEVICES_ARGS[@]}" \
     --num-envs "${NUM_ENVS_ARGS[@]}" \
     --feature-modes "${FEATURE_MODE_ARGS[@]}" \
+    --benchmark-layers "${BENCHMARK_LAYER_ARGS[@]}" \
+    --ccd-iterations "${CCD_ITERATION_ARGS[@]}" \
     --mp-start-method "${MP_START_METHOD}" \
     --repeats "${REPEATS}" \
     --rollouts "${ROLLOUTS}" \

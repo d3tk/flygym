@@ -6,6 +6,8 @@ import math
 from pathlib import Path
 from typing import Any
 
+import gymnasium as gym
+from gymnasium import spaces
 import mujoco as mj
 import numpy as np
 
@@ -35,6 +37,7 @@ ACTION_PRESET_VALUES = np.stack(tuple(ACTION_PRESETS.values())).astype(np.float3
 @dataclass(slots=True)
 class NavigationTaskConfig:
     timestep: float = 1e-4
+    ccd_iterations: int = 300
     decision_steps: int = 500
     episode_time: float = 5.0
     target_radius: float = 2.0
@@ -90,6 +93,8 @@ class NavigationTaskConfig:
         self.obstacle_colors = np.asarray(self.obstacle_colors, dtype=float)
         if self.timestep <= 0:
             raise ValueError("timestep must be positive.")
+        if self.ccd_iterations <= 0:
+            raise ValueError("ccd_iterations must be positive.")
         if self.decision_steps <= 0:
             raise ValueError("decision_steps must be positive.")
         if self.episode_time <= 0:
@@ -134,13 +139,22 @@ class NavigationTaskFactory:
         return OdorObstacleNavigationTask(deepcopy(self.config))
 
 
-class OdorObstacleNavigationTask:
+class OdorObstacleNavigationTask(gym.Env):
+    metadata = {"render_modes": ["rgb_array"]}
     observation_shape = (8,)
 
     def __init__(self, config: NavigationTaskConfig | None = None) -> None:
+        super().__init__()
         self.config = config or NavigationTaskConfig()
-        self.action_space = self.config.action_space
-        if self.action_space == "continuous":
+        self.action_space_name = self.config.action_space
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=self.observation_shape,
+            dtype=np.float32,
+        )
+        self.render_mode = "rgb_array" if self.config.render else None
+        if self.action_space_name == "continuous":
             self.action_shape = (2,)
             self.action_n = None
             self.action_low = np.full(2, self.config.action_bounds[0], dtype=np.float32)
@@ -148,12 +162,19 @@ class OdorObstacleNavigationTask:
                 2, self.config.action_bounds[1], dtype=np.float32
             )
             self.action_max_norm = self.config.action_max_norm
+            self.action_space = spaces.Box(
+                low=self.action_low,
+                high=self.action_high,
+                shape=self.action_shape,
+                dtype=np.float32,
+            )
         else:
             self.action_shape = ()
             self.action_n = len(ACTION_PRESET_NAMES)
             self.action_low = np.array([0], dtype=np.int64)
             self.action_high = np.array([self.action_n - 1], dtype=np.int64)
             self.action_max_norm = None
+            self.action_space = spaces.Discrete(self.action_n)
         self._base_spawn_position = self.config.spawn_position.copy()
         self._base_spawn_yaw = float(self.config.spawn_yaw)
         self._base_odor_source = self.config.odor_source.copy()
@@ -209,7 +230,13 @@ class OdorObstacleNavigationTask:
     def target_position(self) -> np.ndarray:
         return self.current_odor_source[0].copy()
 
-    def reset(self, seed: int | None = None) -> tuple[np.ndarray, dict[str, Any]]:
+    def reset(
+        self,
+        seed: int | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        del options
+        super().reset(seed=seed)
         if seed is not None:
             self._rng = np.random.default_rng(seed)
         spawn_position, spawn_yaw, odor_source, obstacle_positions = (
@@ -246,7 +273,7 @@ class OdorObstacleNavigationTask:
     ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         descending_signal = resolve_navigation_action(
             action,
-            action_space=self.action_space,
+            action_space=self.action_space_name,
             action_low=self.action_low,
             action_high=self.action_high,
             action_max_norm=self.action_max_norm,

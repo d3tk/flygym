@@ -220,9 +220,10 @@ class SubprocTaskRunner:
         self,
         actions: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[dict[str, Any]]]:
+        action_dtype = np.int64 if self.action_space == "discrete" else np.float32
         for idx, action in enumerate(np.asarray(actions)):
             self._send_command(
-                idx, ("step", np.asarray(action, dtype=np.float32))
+                idx, ("step", np.asarray(action, dtype=action_dtype))
             )
         results = [self._recv(idx) for idx in range(self.num_envs)]
         obs, rewards, terminated, truncated, infos = zip(*results, strict=True)
@@ -406,7 +407,7 @@ def _task_worker(conn, task_factory: Callable[[], Any], rank: int) -> None:
 def _task_spec(task) -> TaskRunnerSpec:
     config = getattr(task, "config", None)
     return TaskRunnerSpec(
-        action_space=str(getattr(task, "action_space", "continuous")),
+        action_space=_task_action_space(task),
         action_low=np.asarray(task.action_low, dtype=np.float32),
         action_high=np.asarray(task.action_high, dtype=np.float32),
         action_shape=tuple(getattr(task, "action_shape", task.action_low.shape)),
@@ -430,7 +431,7 @@ def _task_diagnostics(task, *, rank: int) -> dict[str, Any]:
         "rss_bytes": _process_rss_bytes(os.getpid()),
         "wall_time_seconds": time.time(),
         "observation_shape": tuple(getattr(task, "observation_shape", ())),
-        "action_space": str(getattr(task, "action_space", "continuous")),
+        "action_space": _task_action_space(task),
         "action_max_norm": getattr(task, "action_max_norm", None),
         "decision_steps": int(getattr(config, "decision_steps", 0)),
         "decision_interval": float(getattr(config, "decision_interval", 0.0)),
@@ -438,6 +439,20 @@ def _task_diagnostics(task, *, rank: int) -> dict[str, Any]:
         "enable_olfaction": bool(getattr(config, "enable_olfaction", False)),
         "randomize_layout": bool(getattr(config, "randomize_layout", False)),
     }
+
+
+def _task_action_space(task) -> str:
+    action_space = getattr(task, "action_space_name", None)
+    if action_space is not None:
+        return str(action_space)
+    config = getattr(task, "config", None)
+    action_space = getattr(config, "action_space", None)
+    if action_space is not None:
+        return str(action_space)
+    action_space = getattr(task, "action_space", "continuous")
+    if isinstance(action_space, str):
+        return action_space
+    return "continuous"
 
 
 def _cpu_affinity() -> list[int] | None:

@@ -38,7 +38,10 @@ fi
 cd "${REPO_ROOT}"
 
 # Ensure the locked CUDA 12.6 PyTorch build is installed before training (avoids PyPI cu13 wheels).
-uv sync --frozen --extra warp
+# shellcheck source=ensure_cuda_venv.sh
+source "${SCRIPT_DIR}/ensure_cuda_venv.sh"
+ensure_cuda_venv "${REPO_ROOT}"
+verify_cuda_runtime "${REPO_ROOT}"
 
 export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
 export MUJOCO_GL="egl"
@@ -51,6 +54,7 @@ export VECLIB_MAXIMUM_THREADS=1
 
 TIMESTEP=0.0001
 DECISION_STEPS=500
+CCD_ITERATIONS=300
 EPISODE_TIME_SECONDS=5
 N_ENVS=60
 ROLLOUT_STEPS=200
@@ -85,6 +89,7 @@ uv run python scripts/flygym/train_odor_obstacle_navigation.py \
     --gamma 0.99 \
     --entropy-coef 0.0 \
     --timestep "${TIMESTEP}" \
+    --ccd-iterations "${CCD_ITERATIONS}" \
     --decision-steps "${DECISION_STEPS}" \
     --episode-time "${EPISODE_TIME_SECONDS}" \
     --target-radius 2.0 \

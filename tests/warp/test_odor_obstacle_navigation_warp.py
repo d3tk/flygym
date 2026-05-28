@@ -4,10 +4,17 @@ import numpy as np
 import pytest
 
 pytest.importorskip("mujoco_warp")
-pytest.importorskip("warp")
+wp = pytest.importorskip("warp")
 
-from flygym_demo.odor_obstacle_navigation.task import NavigationTaskConfig
-from flygym_demo.odor_obstacle_navigation.warp_runner import WarpNavigationTaskRunner
+pytestmark = pytest.mark.skipif(
+    not any(device.is_cuda for device in wp.get_devices()),
+    reason="Warp CUDA device is not available.",
+)
+
+from flygym_demo.odor_obstacle_navigation.task import NavigationTaskConfig  # noqa: E402
+from flygym_demo.odor_obstacle_navigation.warp_runner import (  # noqa: E402
+    WarpNavigationTaskRunner,
+)
 
 
 def _fast_config(**kwargs) -> NavigationTaskConfig:
@@ -43,8 +50,12 @@ def _assert_vision_feature_ranges(features: dict) -> None:
 
 
 def test_warp_runner_supports_gpu_vision_observations():
-    runner = WarpNavigationTaskRunner(_fast_config(enable_vision=True), num_envs=2)
+    runner = WarpNavigationTaskRunner(
+        _fast_config(enable_vision=True, ccd_iterations=321),
+        num_envs=2,
+    )
     try:
+        assert runner.sim.mj_model.opt.ccd_iterations == 321
         obs, infos = runner.reset(seed=123)
         assert obs.shape == (2, 8)
         assert obs.dtype == np.float32

@@ -76,6 +76,16 @@ def test_task_reset_returns_flat_observation():
         task.close()
 
 
+def test_task_passes_sb3_env_check():
+    from stable_baselines3.common.env_checker import check_env
+
+    task = OdorObstacleNavigationTask(_fast_config())
+    try:
+        check_env(task, warn=False, skip_render_check=True)
+    finally:
+        task.close()
+
+
 def test_progress_reward_sign():
     task = OdorObstacleNavigationTask(_fast_config(enable_olfaction=False))
     try:
@@ -241,10 +251,6 @@ def test_sync_task_runner_batches_steps_and_resets():
 
 
 def test_subproc_task_runner_fails_fast_when_worker_is_killed():
-    class DieOnResetNavigationTask(StubNavigationTask):
-        def reset(self, seed: int | None = None):
-            os.kill(os.getpid(), signal.SIGKILL)
-
     runner = SubprocTaskRunner(
         DieOnResetNavigationTask,
         num_envs=1,
@@ -289,82 +295,98 @@ def test_subproc_task_runner_batches_steps_and_resets():
     ("env_runner", "mp_start_method"),
     [("sync", "spawn"), ("subproc", "forkserver")],
 )
-def test_ppo_smoke_with_stub_task(env_runner: str, mp_start_method: str):
-    pytest.importorskip("torch")
+def test_navigation_vec_env_auto_resets_done_envs(
+    env_runner: str,
+    mp_start_method: str,
+):
+    from flygym_demo.odor_obstacle_navigation.ppo import NavigationVecEnv
 
-    from flygym_demo.odor_obstacle_navigation.ppo import PPOConfig, PPOTrainer
-
-    logged_metrics = []
-    progress_events = []
-    trainer = PPOTrainer(
+    env = NavigationVecEnv(
         StubNavigationTask,
-        PPOConfig(
-            total_timesteps=8,
-            num_envs=2,
-            rollout_steps=4,
-            update_epochs=1,
-            minibatch_size=4,
-            hidden_sizes=(8,),
-            normalize_observations=False,
-            seed=0,
-            env_runner=env_runner,
-            mp_start_method=mp_start_method,
-        ),
+        num_envs=2,
+        env_runner=env_runner,
+        mp_start_method=mp_start_method,
     )
     try:
-        metrics = trainer.train(
-            metrics_callback=logged_metrics.append,
-            progress_callback=progress_events.append,
-            eval_interval=4,
-            eval_episodes=1,
-            eval_seed=10,
-        )
-        results = trainer.evaluate(num_episodes=1, seed=10)
+        obs = env.reset()
+        assert obs.shape == (2, 8)
+        for _ in range(3):
+            obs, rewards, dones, infos = env.step(
+                np.zeros((2, 2), dtype=np.float32)
+            )
 
-        assert metrics["global_step"] >= 8
-        optimizer_steps = [
-            values["train/optimizer_step"]
-            for values in logged_metrics
-            if "train/optimizer_step" in values
-        ]
-        assert optimizer_steps[:2] == [1.0, 2.0]
-        assert _expected_wandb_keys().issubset(logged_metrics[-1])
-        assert {"rollout_start", "rollout_end", "update_start", "update_end"}.issubset(
-            {event["stage"] for event in progress_events}
-        )
-        assert len(results) == 1
+        assert rewards.shape == (2,)
+        assert np.all(dones)
+        assert obs.shape == (2, 8)
+        assert "terminal_observation" in infos[0]
+        assert infos[0]["TimeLimit.truncated"]
+        np.testing.assert_allclose(obs, 0.0)
     finally:
-        trainer.close()
+        env.close()
 
 
-def test_ppo_smoke_with_discrete_stub_task():
-    pytest.importorskip("torch")
+def test_navigation_vec_env_supports_discrete_actions():
+    from gymnasium import spaces
+    from flygym_demo.odor_obstacle_navigation.ppo import NavigationVecEnv
 
-    from flygym_demo.odor_obstacle_navigation.ppo import PPOConfig, PPOTrainer
-
-    trainer = PPOTrainer(
+    env = NavigationVecEnv(
         StubDiscreteNavigationTask,
-        PPOConfig(
-            total_timesteps=8,
-            num_envs=2,
-            rollout_steps=4,
-            update_epochs=1,
-            minibatch_size=4,
-            hidden_sizes=(8,),
-            normalize_observations=False,
-            seed=0,
-            env_runner="sync",
-        ),
+        num_envs=2,
+        env_runner="sync",
     )
     try:
-        metrics = trainer.train(eval_interval=None)
-        action = trainer.act(np.zeros(8, dtype=np.float32))
+        assert isinstance(env.action_space, spaces.Discrete)
+        obs = env.reset()
+        assert obs.shape == (2, 8)
+        obs, rewards, dones, infos = env.step(np.array([0, 1], dtype=np.int64))
 
-        assert metrics["global_step"] >= 8
-        assert np.asarray(action).shape == ()
-        assert 0 <= int(action) < StubDiscreteNavigationTask.action_n
+        assert obs.shape == (2, 8)
+        assert rewards.shape == (2,)
+        assert not np.any(dones)
+        assert [info["step_count"] for info in infos] == [1, 1]
     finally:
-        trainer.close()
+        env.close()
+
+
+@pytest.mark.parametrize(
+    ("task_factory_name", "action_shape"),
+    [("continuous", (2,)), ("discrete", ())],
+)
+def test_sb3_ppo_smoke_learns_saves_loads_and_predicts(
+    tmp_path: Path,
+    task_factory_name: str,
+    action_shape: tuple[int, ...],
+):
+    from stable_baselines3 import PPO
+
+    from flygym_demo.odor_obstacle_navigation.ppo import NavigationVecEnv
+
+    task_factory = (
+        StubNavigationTask
+        if task_factory_name == "continuous"
+        else StubDiscreteNavigationTask
+    )
+    env = NavigationVecEnv(task_factory, num_envs=2, env_runner="sync")
+    model = PPO(
+        "MlpPolicy",
+        env,
+        n_steps=4,
+        batch_size=4,
+        n_epochs=1,
+        policy_kwargs={"net_arch": [8]},
+        seed=0,
+        device="cpu",
+    )
+    try:
+        model.learn(total_timesteps=8)
+        checkpoint = tmp_path / "policy.zip"
+        model.save(checkpoint)
+        loaded = PPO.load(checkpoint, env=env, device="cpu")
+        action, _ = loaded.predict(np.zeros(8, dtype=np.float32), deterministic=True)
+
+        assert np.asarray(action).shape == action_shape
+    finally:
+        env.close()
 
 
 def test_subproc_real_task_short_rollout_runs():
@@ -401,8 +423,96 @@ def test_benchmark_supports_cuda_vision_feature_mode():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
 
+    default_args = module.parse_args([])
+    assert default_args.ccd_iterations == [300]
     assert module._supports_feature_mode("cuda", vision=True, olfaction=True)
     assert module._supports_feature_mode("cuda", vision=True, olfaction=False)
+    args = module.parse_args(
+        [
+            "--ccd-iterations",
+            "200",
+            "250",
+            "300",
+            "350",
+            "400",
+            "--benchmark-layers",
+            "env",
+            "ppo",
+        ]
+    )
+    assert args.ccd_iterations == [200, 250, 300, 350, 400]
+    assert args.benchmark_layers == ["env", "ppo"]
+
+
+def test_ccd_tuner_defaults_to_warp_stress_sweep():
+    module = _load_ccd_tuner()
+    args = module.parse_args([])
+
+    assert args.ccd_iterations == [200, 250, 300, 350, 400]
+    assert args.repeats == 5
+    assert args.num_envs == 64
+    assert args.feature_mode == "full"
+    assert args.rollout_steps == 200
+    assert args.decision_steps == 500
+
+
+def test_ccd_tuner_counts_warnings():
+    module = _load_ccd_tuner()
+
+    assert (
+        module.count_ccd_warnings(
+            "Warning: opt.ccd_iterations, currently set to 100, "
+            "needs to be increased."
+        )
+        == 1
+    )
+    assert module.count_ccd_warnings("Warning: unrelated") == 0
+
+
+def test_ccd_tuner_obstacle_clearance_metric():
+    module = _load_ccd_tuner()
+    clearances = module.min_obstacle_clearances(
+        np.array([[7.5, 0.0, 0.8], [9.0, 0.0, 0.8]], dtype=float),
+        np.array([[7.5, 0.0]], dtype=float),
+        obstacle_radius=1.0,
+    )
+
+    np.testing.assert_allclose(clearances, [-1.0, 0.5])
+
+
+def test_ccd_tuner_recommends_lowest_stable_value():
+    module = _load_ccd_tuner()
+    row = module.TrialResult
+    rows = [
+        row(100, 0, 4, 1.0, 10.0, 9.0, 1000.0, 0, 0.1, 5.0),
+        row(200, 0, 0, 1.0, 10.8, 9.8, 930.0, 0, 0.1, 5.0),
+        row(300, 0, 0, 1.0, 12.0, 11.0, 850.0, 0, 0.1, 5.0),
+    ]
+
+    assert (
+        module.choose_recommended_ccd(
+            rows,
+            max_warning_count=0,
+            max_slowdown_percent=10.0,
+            max_mean_obstacle_clearance=0.5,
+        )
+        == 200
+    )
+
+
+def _load_ccd_tuner():
+    tuner_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts/flygym/tune_warp_ccd_iterations.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "tune_warp_ccd_iterations", tuner_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 class StubTaskConfig:
@@ -450,6 +560,11 @@ class StubNavigationTask:
         pass
 
 
+class DieOnResetNavigationTask(StubNavigationTask):
+    def reset(self, seed: int | None = None):
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
 class StubDiscreteNavigationTask:
     observation_shape = (8,)
     action_space = "discrete"
@@ -489,35 +604,3 @@ class StubDiscreteNavigationTask:
 
     def close(self) -> None:
         pass
-
-
-def _expected_wandb_keys() -> set[str]:
-    return {
-        "eval/success_rate",
-        "eval/mean_reward",
-        "eval/mean_ep_length",
-        "rollout/success_rate",
-        "rollout/ep_rew_mean",
-        "rollout/ep_len_mean",
-        "train/loss",
-        "train/explained_variance",
-        "train/learning_rate",
-        "train/value_loss",
-        "train/std",
-        "train/policy_gradient_loss",
-        "train/entropy_loss",
-        "train/clip_range",
-        "train/clip_fraction",
-        "train/approx_kl",
-        "train/optimizer_step",
-        "time/fps",
-        "speed/wall_time_seconds",
-        "speed/total_timesteps_per_sec",
-        "speed/simulator_substeps_per_sec",
-        "speed/rollout_wall_seconds",
-        "speed/simulated_seconds_per_sec",
-        "speed/rollout_timesteps_per_sec",
-        "speed/rollout_index",
-        "speed/parent_cpu_percent",
-        "global_step",
-    }

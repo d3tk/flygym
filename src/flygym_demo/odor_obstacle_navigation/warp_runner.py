@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import os
+import time
 from typing import Any
 
 import mujoco as mj
@@ -28,6 +30,10 @@ from flygym_demo.odor_obstacle_navigation.task import (
     _yaw_to_quat_wxyz,
 )
 from flygym_demo.odor_obstacle_navigation.world import ObstacleOdorWorld
+
+_N_LEGS = len(LEGS)
+_N_STEP_DOFS = len(PreprogrammedSteps.dofs_per_leg)
+_TWO_PI = 2 * np.pi
 
 
 @wp.kernel
@@ -115,6 +121,107 @@ def _summarize_vision_kernel(
         wp.atomic_add(summary, world_idx, summary_col + 2, 1.0)
 
 
+@wp.kernel
+def _cpg_update_kernel(
+    actions: wp.array2d(dtype=wp.float32),
+    phases: wp.array2d(dtype=wp.float32),
+    magnitudes: wp.array2d(dtype=wp.float32),
+    base_intrinsic_freqs: wp.array(dtype=wp.float32),
+    coupling_weights: wp.array2d(dtype=wp.float32),
+    phase_biases: wp.array2d(dtype=wp.float32),
+    convergence_coefs: wp.array(dtype=wp.float32),
+    next_phases: wp.array2d(dtype=wp.float32),
+    next_magnitudes: wp.array2d(dtype=wp.float32),
+    timestep: float,
+    action_low: float,
+    action_high: float,
+):
+    env_idx, leg_idx = wp.tid()
+    side_idx = wp.int32(0)
+    if leg_idx >= 3:
+        side_idx = 1
+    descending_signal = actions[env_idx, side_idx]
+    if descending_signal < action_low:
+        descending_signal = action_low
+    if descending_signal > action_high:
+        descending_signal = action_high
+
+    intrinsic_freq = base_intrinsic_freqs[leg_idx]
+    if descending_signal < 0.0:
+        intrinsic_freq = -intrinsic_freq
+
+    phase = phases[env_idx, leg_idx]
+    coupling = wp.float32(0.0)
+    for other_leg_idx in range(_N_LEGS):
+        phase_diff = phases[env_idx, other_leg_idx] - phase
+        coupling += (
+            magnitudes[env_idx, other_leg_idx]
+            * coupling_weights[leg_idx, other_leg_idx]
+            * wp.sin(phase_diff - phase_biases[leg_idx, other_leg_idx])
+        )
+
+    dtheta_dt = wp.float32(_TWO_PI) * intrinsic_freq + coupling
+    intrinsic_amp = wp.abs(descending_signal)
+    dr_dt = convergence_coefs[leg_idx] * (
+        intrinsic_amp - magnitudes[env_idx, leg_idx]
+    )
+
+    next_phase = phase + dtheta_dt * timestep
+    next_phase = next_phase - wp.floor(next_phase / wp.float32(_TWO_PI)) * wp.float32(
+        _TWO_PI
+    )
+    next_phases[env_idx, leg_idx] = next_phase
+    next_magnitudes[env_idx, leg_idx] = magnitudes[env_idx, leg_idx] + dr_dt * timestep
+
+
+@wp.kernel
+def _cpg_output_kernel(
+    phases: wp.array2d(dtype=wp.float32),
+    magnitudes: wp.array2d(dtype=wp.float32),
+    next_phases: wp.array2d(dtype=wp.float32),
+    next_magnitudes: wp.array2d(dtype=wp.float32),
+    spline_coeffs: wp.array4d(dtype=wp.float32),
+    neutral_angles: wp.array2d(dtype=wp.float32),
+    dof_to_output_idx: wp.array2d(dtype=wp.int32),
+    swing_periods: wp.array2d(dtype=wp.float32),
+    joint_angles: wp.array2d(dtype=wp.float32),
+    adhesion: wp.array2d(dtype=wp.float32),
+    phase_grid_step: float,
+    n_intervals: int,
+):
+    env_idx, leg_idx = wp.tid()
+    phase = next_phases[env_idx, leg_idx]
+    magnitude = next_magnitudes[env_idx, leg_idx]
+    phases[env_idx, leg_idx] = phase
+    magnitudes[env_idx, leg_idx] = magnitude
+
+    adhesion_value = wp.float32(1.0)
+    if phase > swing_periods[leg_idx, 0] and phase < swing_periods[leg_idx, 1]:
+        adhesion_value = wp.float32(0.0)
+    adhesion[env_idx, leg_idx] = adhesion_value
+
+    interval_idx = wp.int32(wp.floor(phase / phase_grid_step))
+    if interval_idx < 0:
+        interval_idx = 0
+    if interval_idx >= n_intervals:
+        interval_idx = n_intervals - 1
+    phase_offset = phase - wp.float32(interval_idx) * phase_grid_step
+
+    for dof_idx in range(_N_STEP_DOFS):
+        output_idx = dof_to_output_idx[leg_idx, dof_idx]
+        if output_idx >= 0:
+            value = (
+                (
+                    spline_coeffs[leg_idx, dof_idx, 0, interval_idx] * phase_offset
+                    + spline_coeffs[leg_idx, dof_idx, 1, interval_idx]
+                )
+                * phase_offset
+                + spline_coeffs[leg_idx, dof_idx, 2, interval_idx]
+            ) * phase_offset + spline_coeffs[leg_idx, dof_idx, 3, interval_idx]
+            neutral = neutral_angles[leg_idx, dof_idx]
+            joint_angles[env_idx, output_idx] = neutral + magnitude * (value - neutral)
+
+
 class WarpNavigationTaskRunner:
     """Batched MuJoCo-Warp runner for the odor obstacle navigation PPO loop.
 
@@ -123,6 +230,7 @@ class WarpNavigationTaskRunner:
     """
 
     def __init__(self, config: NavigationTaskConfig, num_envs: int) -> None:
+        self._require_cuda_device()
         self.config = deepcopy(config)
         if self.config.randomize_layout:
             raise NotImplementedError(
@@ -162,12 +270,16 @@ class WarpNavigationTaskRunner:
             bodysegs_with_ground_contact=ContactBodiesPreset.TIBIA_TARSUS_ONLY,
             add_ground_contact_sensors=False,
         )
+        self.world.mjcf_root.option.ccd_iterations = self.config.ccd_iterations
         self.sim = GPUSimulation(self.world, n_worlds=self.num_envs)
         self.sim.mj_model.opt.timestep = self.config.timestep
         self.sim.mjw_model, self.sim.mjw_data = self.sim._mj_structs_to_mjw_structs()
         self._vision_renderer = None
         self._retina = None
         self._setup_vision()
+        self._wp_device = self.sim.mjw_data.qpos.device
+        if not self._wp_device.is_cuda:
+            raise RuntimeError(f"Expected a CUDA Warp device, got {self._wp_device}.")
 
         self._root_qposadr, self._root_qveladr = self._find_root_addresses()
         self._thorax_body_idx = self.fly.get_bodysegs_order().index(
@@ -176,13 +288,19 @@ class WarpNavigationTaskRunner:
         self._olfaction_site_ids = self.sim._internal_olfaction_siteids_by_fly.get(
             self.fly.name, np.array([], dtype=np.int32)
         )
-        self.controller = _BatchedOpenLoopTurningController(
+        self._actions_wp = wp.zeros(
+            (self.num_envs, 2), dtype=wp.float32, device=self._wp_device
+        )
+        self.controller = _GPUOpenLoopTurningController(
             num_envs=self.num_envs,
             timestep=self.config.timestep,
             output_dof_order=self.fly.get_actuated_jointdofs_order(
                 ActuatorType.POSITION
             ),
+            action_bounds=self.config.action_bounds,
+            device=self._wp_device,
         )
+        self._decision_graph = self._capture_decision_graph()
         self._neutral_qpos = np.asarray(self.sim.mj_data.qpos, dtype=np.float32).copy()
         self._neutral_qvel = np.asarray(self.sim.mj_data.qvel, dtype=np.float32).copy()
         self._neutral_ctrl = np.asarray(self.sim.mj_data.ctrl, dtype=np.float32).copy()
@@ -196,6 +314,18 @@ class WarpNavigationTaskRunner:
         self.current_obstacle_positions = np.repeat(
             self.config.obstacle_positions[np.newaxis, :, :], self.num_envs, axis=0
         )
+        self._diagnostic_step_count = 0
+        self._diagnostic_wall_seconds = {
+            "action_assign": 0.0,
+            "graph_launch": 0.0,
+            "state_reward": 0.0,
+            "odor": 0.0,
+            "vision": 0.0,
+            "observation_assemble": 0.0,
+            "info": 0.0,
+            "total_step": 0.0,
+        }
+        self._last_action_source = ""
 
     @property
     def decision_steps(self) -> float:
@@ -273,18 +403,20 @@ class WarpNavigationTaskRunner:
 
     def step(
         self,
-        actions: np.ndarray,
+        actions: Any,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[dict[str, Any]]]:
+        step_started_at = time.perf_counter()
         actions = self._resolve_actions(actions)
 
-        for _ in range(self.config.decision_steps):
-            joint_angles, adhesion = self.controller.step(actions)
-            self.sim.set_actuator_inputs(
-                self.fly.name, ActuatorType.POSITION, joint_angles
-            )
-            self.sim.set_leg_adhesion_states(self.fly.name, adhesion)
-            self.sim.step()
+        phase_started_at = time.perf_counter()
+        self._last_action_source = self._assign_actions(actions)
+        self._record_diagnostic_time("action_assign", phase_started_at)
 
+        phase_started_at = time.perf_counter()
+        wp.capture_launch(self._decision_graph)
+        self._record_diagnostic_time("graph_launch", phase_started_at)
+
+        phase_started_at = time.perf_counter()
         indices = np.arange(self.num_envs, dtype=np.int32)
         self._decision_counts += 1
         fly_positions = self._fly_positions()
@@ -301,7 +433,14 @@ class WarpNavigationTaskRunner:
         truncated = np.logical_and(
             ~terminated, self._decision_counts >= self.config.max_decision_steps
         )
-        observations, features = self._make_observations(indices=indices)
+        self._record_diagnostic_time("state_reward", phase_started_at)
+
+        observations, features = self._make_observations(
+            indices=indices,
+            record_diagnostics=True,
+        )
+
+        phase_started_at = time.perf_counter()
         infos = [
             self._make_info(
                 int(env_idx),
@@ -316,13 +455,93 @@ class WarpNavigationTaskRunner:
             )
             for row, env_idx in enumerate(indices)
         ]
+        self._record_diagnostic_time("info", phase_started_at)
+        self._diagnostic_step_count += 1
+        self._record_diagnostic_time("total_step", step_started_at)
         return observations, rewards, terminated, truncated, infos
 
     def close(self) -> None:
         self.sim.close()
 
     def diagnostics(self) -> list[dict[str, Any]]:
-        return []
+        observation_wall_seconds = (
+            self._diagnostic_wall_seconds["odor"]
+            + self._diagnostic_wall_seconds["vision"]
+            + self._diagnostic_wall_seconds["observation_assemble"]
+        )
+        return [
+            {
+                "rank": 0,
+                "pid": os.getpid(),
+                "ppid": os.getppid(),
+                "cpu_affinity": _cpu_affinity(),
+                "cpu_affinity_count": _cpu_affinity_count(),
+                "cpu_seconds": _process_cpu_seconds(),
+                "num_envs": self.num_envs,
+                "warp_devices": _warp_device_names(),
+                "warp_cuda_devices": _warp_cuda_device_names(),
+                "selected_warp_device": str(self._wp_device),
+                "warp_cuda_graph_captured": True,
+                "warp_last_action_source": self._last_action_source,
+                "warp_step_count": self._diagnostic_step_count,
+                "warp_step_total_wall_seconds": self._diagnostic_wall_seconds[
+                    "total_step"
+                ],
+                "warp_step_action_assign_wall_seconds": self._diagnostic_wall_seconds[
+                    "action_assign"
+                ],
+                "warp_step_graph_launch_wall_seconds": self._diagnostic_wall_seconds[
+                    "graph_launch"
+                ],
+                "warp_step_state_reward_wall_seconds": self._diagnostic_wall_seconds[
+                    "state_reward"
+                ],
+                "warp_step_observation_wall_seconds": observation_wall_seconds,
+                "warp_step_odor_wall_seconds": self._diagnostic_wall_seconds["odor"],
+                "warp_step_vision_wall_seconds": self._diagnostic_wall_seconds[
+                    "vision"
+                ],
+                "warp_step_observation_assemble_wall_seconds": (
+                    self._diagnostic_wall_seconds["observation_assemble"]
+                ),
+                "warp_step_info_wall_seconds": self._diagnostic_wall_seconds["info"],
+            }
+        ]
+
+    @staticmethod
+    def _require_cuda_device() -> None:
+        cuda_devices = _warp_cuda_device_names()
+        if not cuda_devices:
+            devices = ", ".join(_warp_device_names()) or "none"
+            raise RuntimeError(
+                "WarpNavigationTaskRunner requires a CUDA Warp device; "
+                f"available Warp devices: {devices}."
+            )
+
+    def _assign_actions(self, actions: Any) -> str:
+        if isinstance(actions, wp.array):
+            wp.copy(self._actions_wp, actions)
+            return "warp"
+        if actions.__class__.__module__.startswith("torch"):
+            source = wp.from_torch(actions.detach().contiguous(), dtype=wp.float32)
+            wp.copy(self._actions_wp, source)
+            return f"torch:{actions.device}"
+        self._actions_wp.assign(np.asarray(actions, dtype=np.float32))
+        return "numpy"
+
+    def _capture_decision_graph(self):
+        with wp.ScopedCapture() as capture:
+            for _ in range(self.config.decision_steps):
+                joint_angles, adhesion = self.controller.step(self._actions_wp)
+                self.sim.set_actuator_inputs(
+                    self.fly.name, ActuatorType.POSITION, joint_angles
+                )
+                self.sim.set_leg_adhesion_states(self.fly.name, adhesion)
+                self.sim.step()
+        return capture.graph
+
+    def _record_diagnostic_time(self, name: str, started_at: float) -> None:
+        self._diagnostic_wall_seconds[name] += time.perf_counter() - started_at
 
     def _make_world(self) -> ObstacleOdorWorld:
         return ObstacleOdorWorld(
@@ -334,8 +553,12 @@ class WarpNavigationTaskRunner:
             obstacle_colors=self.config.obstacle_colors,
         )
 
-    def _resolve_actions(self, actions: np.ndarray) -> np.ndarray:
+    def _resolve_actions(self, actions: Any) -> Any:
         if self.action_space == "continuous":
+            if actions.__class__.__module__.startswith("torch"):
+                if tuple(actions.shape) != (self.num_envs, 2):
+                    raise ValueError(f"actions must have shape ({self.num_envs}, 2).")
+                return actions
             actions = np.asarray(actions, dtype=np.float32)
             if actions.shape != (self.num_envs, 2):
                 raise ValueError(f"actions must have shape ({self.num_envs}, 2).")
@@ -347,7 +570,10 @@ class WarpNavigationTaskRunner:
                 ]
             ).astype(np.float32)
 
-        action_indices = np.asarray(actions)
+        if actions.__class__.__module__.startswith("torch"):
+            action_indices = actions.detach().cpu().numpy()
+        else:
+            action_indices = np.asarray(actions)
         if action_indices.shape == (self.num_envs, 1):
             action_indices = action_indices[:, 0]
         if action_indices.shape != (self.num_envs,):
@@ -402,13 +628,20 @@ class WarpNavigationTaskRunner:
         return np.linalg.norm(fly_positions[:, :2] - targets[:, :2], axis=1)
 
     def _make_observations(
-        self, *, indices: np.ndarray
+        self, *, indices: np.ndarray, record_diagnostics: bool = False
     ) -> tuple[np.ndarray, list[dict[str, Any]]]:
         observations = np.zeros(
             (len(indices), *self.observation_shape), dtype=np.float32
         )
+        phase_started_at = time.perf_counter()
         odor = self._odor_features(indices)
+        if record_diagnostics:
+            self._record_diagnostic_time("odor", phase_started_at)
+        phase_started_at = time.perf_counter()
         vision = self._vision_features(indices)
+        if record_diagnostics:
+            self._record_diagnostic_time("vision", phase_started_at)
+        phase_started_at = time.perf_counter()
         features = []
         for row in range(len(indices)):
             vision_features = vision[row]
@@ -434,6 +667,8 @@ class WarpNavigationTaskRunner:
                     **vision_features,
                 }
             )
+        if record_diagnostics:
+            self._record_diagnostic_time("observation_assemble", phase_started_at)
         return observations, features
 
     def _setup_vision(self) -> None:
@@ -653,81 +888,189 @@ class WarpNavigationTaskRunner:
         }
 
 
-class _BatchedOpenLoopTurningController:
-    def __init__(self, num_envs: int, timestep: float, output_dof_order) -> None:
+class _GPUOpenLoopTurningController:
+    def __init__(
+        self,
+        num_envs: int,
+        timestep: float,
+        output_dof_order,
+        action_bounds: tuple[float, float],
+        device,
+    ) -> None:
         self.num_envs = int(num_envs)
         self.timestep = float(timestep)
         self.output_dof_order = list(output_dof_order)
         self.preprogrammed_steps = PreprogrammedSteps()
         network = make_tripod_cpg_network(timestep)
-        self._base_intrinsic_freqs = network.intrinsic_freqs.astype(np.float32)
-        self._coupling_weights = network.coupling_weights.astype(np.float32)
-        self._phase_biases = network.phase_biases.astype(np.float32)
-        self._convergence_coefs = network.convergence_coefs.astype(np.float32)
-        self.phases = np.zeros((self.num_envs, len(LEGS)), dtype=np.float32)
-        self.magnitudes = np.zeros((self.num_envs, len(LEGS)), dtype=np.float32)
         self._dof_to_output_idx = {
             dof: idx for idx, dof in enumerate(self.output_dof_order)
         }
+        self._phases_host = np.zeros((self.num_envs, len(LEGS)), dtype=np.float32)
+        self._magnitudes_host = np.zeros((self.num_envs, len(LEGS)), dtype=np.float32)
+        self.phases = wp.zeros(
+            (self.num_envs, len(LEGS)), dtype=wp.float32, device=device
+        )
+        self.magnitudes = wp.zeros(
+            (self.num_envs, len(LEGS)), dtype=wp.float32, device=device
+        )
+        self._next_phases = wp.zeros(
+            (self.num_envs, len(LEGS)), dtype=wp.float32, device=device
+        )
+        self._next_magnitudes = wp.zeros(
+            (self.num_envs, len(LEGS)), dtype=wp.float32, device=device
+        )
+        self.joint_angles = wp.zeros(
+            (self.num_envs, len(self.output_dof_order)),
+            dtype=wp.float32,
+            device=device,
+        )
+        self.adhesion = wp.zeros(
+            (self.num_envs, len(LEGS)), dtype=wp.float32, device=device
+        )
+        self._base_intrinsic_freqs = wp.array(
+            network.intrinsic_freqs.astype(np.float32),
+            dtype=wp.float32,
+            device=device,
+        )
+        self._coupling_weights = wp.array(
+            network.coupling_weights.astype(np.float32),
+            dtype=wp.float32,
+            device=device,
+        )
+        self._phase_biases = wp.array(
+            network.phase_biases.astype(np.float32), dtype=wp.float32, device=device
+        )
+        self._convergence_coefs = wp.array(
+            network.convergence_coefs.astype(np.float32),
+            dtype=wp.float32,
+            device=device,
+        )
+        self._spline_coeffs, self._neutral_angles, self._phase_grid_step = (
+            self._make_step_interpolation_tables()
+        )
+        self._n_intervals = self._spline_coeffs.shape[3]
+        self._spline_coeffs = wp.array(
+            self._spline_coeffs, dtype=wp.float32, device=device
+        )
+        self._neutral_angles = wp.array(
+            self._neutral_angles, dtype=wp.float32, device=device
+        )
+        self._dof_to_output_idx_wp = wp.array(
+            self._make_dof_to_output_idx(), dtype=wp.int32, device=device
+        )
+        self._swing_periods = wp.array(
+            self._make_swing_periods(), dtype=wp.float32, device=device
+        )
+        self._action_low = float(action_bounds[0])
+        self._action_high = float(action_bounds[1])
         self.reset_at(np.arange(self.num_envs, dtype=np.int32), [None] * self.num_envs)
 
     def reset_at(self, indices: np.ndarray, seeds: list[int | None]) -> None:
         for env_idx, seed in zip(indices, seeds, strict=True):
             rng = np.random.default_rng(seed)
-            self.phases[int(env_idx)] = rng.random(len(LEGS)) * 2 * np.pi
-            self.magnitudes[int(env_idx)] = 0.0
-
-    def step(self, descending_signals: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        intrinsic_amps = np.repeat(
-            np.abs(descending_signals[:, :, np.newaxis]), 3, axis=2
-        ).reshape(self.num_envs, len(LEGS))
-        intrinsic_freqs = np.repeat(
-            self._base_intrinsic_freqs[np.newaxis, :], self.num_envs, axis=0
-        )
-        intrinsic_freqs[:, :3] *= np.where(descending_signals[:, 0:1] >= 0, 1.0, -1.0)
-        intrinsic_freqs[:, 3:] *= np.where(descending_signals[:, 1:2] >= 0, 1.0, -1.0)
-
-        phase_diff = self.phases[:, np.newaxis, :] - self.phases[:, :, np.newaxis]
-        coupling = (
-            self.magnitudes[:, np.newaxis, :]
-            * self._coupling_weights[np.newaxis, :, :]
-            * np.sin(phase_diff - self._phase_biases[np.newaxis, :, :])
-        ).sum(axis=2)
-        dtheta_dt = 2 * np.pi * intrinsic_freqs + coupling
-        dr_dt = self._convergence_coefs * (intrinsic_amps - self.magnitudes)
-        self.phases += (dtheta_dt * self.timestep).astype(np.float32)
-        self.phases = np.mod(self.phases, 2 * np.pi).astype(np.float32)
-        self.magnitudes += (dr_dt * self.timestep).astype(np.float32)
-        return self._joint_angles(), self._adhesion()
-
-    def _joint_angles(self) -> np.ndarray:
-        joint_angles = np.zeros(
-            (self.num_envs, len(self.output_dof_order)), dtype=np.float32
-        )
-        for leg_idx, leg in enumerate(LEGS):
-            leg_angles = self.preprogrammed_steps.get_joint_angles(
-                leg,
-                self.phases[:, leg_idx],
-                self.magnitudes[:, leg_idx],
+            self._phases_host[int(env_idx)] = (
+                rng.random(len(LEGS), dtype=np.float32) * np.float32(_TWO_PI)
             )
+            self._magnitudes_host[int(env_idx)] = 0.0
+        self.phases.assign(self._phases_host)
+        self.magnitudes.assign(self._magnitudes_host)
+
+    def step(self, descending_signals) -> tuple[wp.array, wp.array]:
+        wp.launch(
+            _cpg_update_kernel,
+            dim=(self.num_envs, len(LEGS)),
+            inputs=[
+                descending_signals,
+                self.phases,
+                self.magnitudes,
+                self._base_intrinsic_freqs,
+                self._coupling_weights,
+                self._phase_biases,
+                self._convergence_coefs,
+                self._next_phases,
+                self._next_magnitudes,
+                self.timestep,
+                self._action_low,
+                self._action_high,
+            ],
+        )
+        wp.launch(
+            _cpg_output_kernel,
+            dim=(self.num_envs, len(LEGS)),
+            inputs=[
+                self.phases,
+                self.magnitudes,
+                self._next_phases,
+                self._next_magnitudes,
+                self._spline_coeffs,
+                self._neutral_angles,
+                self._dof_to_output_idx_wp,
+                self._swing_periods,
+                self.joint_angles,
+                self.adhesion,
+                self._phase_grid_step,
+                self._n_intervals,
+            ],
+        )
+        return self.joint_angles, self.adhesion
+
+    def _make_step_interpolation_tables(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        n_intervals = self.preprogrammed_steps._length - 1
+        coeffs = np.empty(
+            (len(LEGS), _N_STEP_DOFS, 4, n_intervals), dtype=np.float32
+        )
+        neutral_angles = np.empty((len(LEGS), _N_STEP_DOFS), dtype=np.float32)
+        for leg_idx, leg in enumerate(LEGS):
+            coeffs[leg_idx] = np.transpose(
+                self.preprogrammed_steps._psi_funcs[leg].c, (2, 0, 1)
+            ).astype(np.float32)
+            neutral_angles[leg_idx] = self.preprogrammed_steps.neutral_pos[leg][
+                :, 0
+            ].astype(np.float32)
+        return coeffs, neutral_angles, float(_TWO_PI / n_intervals)
+
+    def _make_dof_to_output_idx(self) -> np.ndarray:
+        dof_to_output_idx = np.full((len(LEGS), _N_STEP_DOFS), -1, dtype=np.int32)
+        for leg_idx, leg in enumerate(LEGS):
             for dof_idx, dof_spec in enumerate(self.preprogrammed_steps.dofs_per_leg):
                 output_idx = self._dof_to_output_idx.get(
                     dof_spec_to_jointdof(leg, dof_spec)
                 )
                 if output_idx is not None:
-                    joint_angles[:, output_idx] = leg_angles[dof_idx]
-        return joint_angles
+                    dof_to_output_idx[leg_idx, dof_idx] = output_idx
+        return dof_to_output_idx
 
-    def _adhesion(self) -> np.ndarray:
-        adhesion = np.ones((self.num_envs, len(LEGS)), dtype=np.float32)
-        phase_mod = np.mod(self.phases, 2 * np.pi)
-        for leg_idx, leg in enumerate(LEGS):
-            swing_start, swing_end = self.preprogrammed_steps.swing_period[leg]
-            adhesion[:, leg_idx] = ~(
-                (phase_mod[:, leg_idx] > swing_start)
-                & (phase_mod[:, leg_idx] < swing_end)
-            )
-        return adhesion
+    def _make_swing_periods(self) -> np.ndarray:
+        return np.asarray(
+            [self.preprogrammed_steps.swing_period[leg] for leg in LEGS],
+            dtype=np.float32,
+        )
+
+
+def _warp_device_names() -> list[str]:
+    return [str(device) for device in wp.get_devices()]
+
+
+def _warp_cuda_device_names() -> list[str]:
+    return [str(device) for device in wp.get_devices() if device.is_cuda]
+
+
+def _cpu_affinity() -> list[int] | None:
+    if not hasattr(os, "sched_getaffinity"):
+        return None
+    return sorted(os.sched_getaffinity(0))
+
+
+def _cpu_affinity_count() -> int | None:
+    affinity = _cpu_affinity()
+    return None if affinity is None else len(affinity)
+
+
+def _process_cpu_seconds() -> float:
+    process_times = os.times()
+    return float(process_times.user + process_times.system)
 
 
 def _fisheye_ommatidia_pixel_map(

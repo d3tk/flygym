@@ -11,6 +11,9 @@ from pathlib import Path
 import statistics
 import sys
 import time
+from typing import Sequence
+
+import numpy as np
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -26,12 +29,13 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 import torch  # noqa: E402
+from stable_baselines3 import PPO  # noqa: E402
 
 from flygym_demo.odor_obstacle_navigation import (  # noqa: E402
     NavigationTaskConfig,
     NavigationTaskFactory,
     PPOConfig,
-    PPOTrainer,
+    make_navigation_vec_env,
 )
 from flygym_demo.odor_obstacle_navigation.runners import SubprocWorkerError  # noqa: E402
 
@@ -45,6 +49,8 @@ FEATURE_MODES = {
 
 @dataclass(slots=True)
 class BenchmarkResult:
+    benchmark_layer: str
+    ccd_iterations: int
     ppo_device: str
     env_device: str
     runner: str
@@ -68,23 +74,30 @@ class BenchmarkResult:
     total_decisions_per_second: float
     simulator_substeps_per_second: float
     simulated_seconds_per_second: float
-    phase_obs_normalize_wall_seconds: float
-    phase_policy_forward_wall_seconds: float
-    phase_action_transfer_wall_seconds: float
-    phase_env_step_wall_seconds: float
-    phase_reset_wall_seconds: float
-    phase_bootstrap_wall_seconds: float
-    phase_advantage_wall_seconds: float
-    phase_tensorize_wall_seconds: float
     worker_pid_count: int
     worker_affinity_count_min: int
     worker_affinity_count_max: int
     worker_cpu_percent_sum: float
     worker_cpu_percent_mean: float
     worker_cpu_percent_max: float
+    warp_devices: str
+    warp_cuda_devices: str
+    selected_warp_device: str
+    warp_cuda_graph_captured: str
+    warp_last_action_source: str
+    warp_step_count: int
+    warp_step_total_wall_seconds: float
+    warp_step_action_assign_wall_seconds: float
+    warp_step_graph_launch_wall_seconds: float
+    warp_step_state_reward_wall_seconds: float
+    warp_step_observation_wall_seconds: float
+    warp_step_odor_wall_seconds: float
+    warp_step_vision_wall_seconds: float
+    warp_step_observation_assemble_wall_seconds: float
+    warp_step_info_wall_seconds: float
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark odor obstacle navigation training throughput."
     )
@@ -103,6 +116,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--rollouts", type=int, default=1)
     parser.add_argument("--rollout-steps", type=int, default=20)
+    parser.add_argument(
+        "--benchmark-layers",
+        nargs="+",
+        choices=["ppo", "env", "raw"],
+        default=["ppo"],
+        help="Benchmark full PPO, environment-only rollout, and/or raw GPUSimulation.",
+    )
     parser.add_argument("--minibatch-size", type=int, default=1200)
     parser.add_argument("--update-epochs", type=int, default=1)
     parser.add_argument("--hidden-sizes", type=int, nargs="+", default=[128, 128])
@@ -129,6 +149,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument("--timestep", type=float, default=1e-4)
+    parser.add_argument(
+        "--ccd-iterations",
+        type=int,
+        nargs="+",
+        default=[NavigationTaskConfig().ccd_iterations],
+    )
     parser.add_argument("--decision-steps", type=int, default=500)
     parser.add_argument("--episode-time", type=float, default=5.0)
     parser.add_argument("--target-radius", type=float, default=2.0)
@@ -161,7 +187,7 @@ def parse_args() -> argparse.Namespace:
             "By default the benchmark exits immediately."
         ),
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -174,63 +200,142 @@ def main() -> None:
         raise ValueError("rollout_steps must be positive.")
     if any(num_envs <= 0 for num_envs in args.num_envs):
         raise ValueError("all num-envs values must be positive.")
+    if any(ccd_iterations <= 0 for ccd_iterations in args.ccd_iterations):
+        raise ValueError("all ccd-iterations values must be positive.")
 
     ppo_devices = _requested_ppo_devices(args)
     env_devices = _requested_env_devices(args)
     feature_modes = _requested_feature_modes(args)
     _validate_ppo_devices(ppo_devices)
     _validate_env_devices(env_devices)
+    if "raw" in args.benchmark_layers:
+        _validate_env_devices(["cuda"])
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     rows: list[BenchmarkResult] = []
     print(_system_summary(args, ppo_devices, env_devices, feature_modes), flush=True)
-    for ppo_device in ppo_devices:
+    if "ppo" in args.benchmark_layers:
+        for ppo_device in ppo_devices:
+            for env_device in env_devices:
+                runners = _requested_runners(args, env_device)
+                for runner in runners:
+                    for feature_mode in feature_modes:
+                        vision, olfaction = FEATURE_MODES[feature_mode]
+                        if not _supports_feature_mode(env_device, vision, olfaction):
+                            print(
+                                "Skipping "
+                                f"ppo_device={ppo_device} env_device={env_device} "
+                                f"runner={runner} features={feature_mode}: "
+                                "unsupported feature mode.",
+                                flush=True,
+                            )
+                            continue
+                        for ccd_iterations in args.ccd_iterations:
+                            for num_envs in args.num_envs:
+                                for repeat in range(args.repeats):
+                                    try:
+                                        result = _run_trial(
+                                            args,
+                                            ccd_iterations,
+                                            ppo_device,
+                                            env_device,
+                                            runner,
+                                            feature_mode,
+                                            vision,
+                                            olfaction,
+                                            num_envs,
+                                            repeat,
+                                        )
+                                    except SubprocWorkerError as exc:
+                                        _handle_worker_failure(
+                                            args,
+                                            exc,
+                                            benchmark_layer="ppo",
+                                            ppo_device=ppo_device,
+                                            env_device=env_device,
+                                            runner=runner,
+                                            feature_mode=feature_mode,
+                                            num_envs=num_envs,
+                                            repeat=repeat,
+                                        )
+                                        continue
+                                    rows.append(result)
+                                    _print_trial(result)
+                                    _write_rows(args.output_csv, rows)
+    if "env" in args.benchmark_layers:
         for env_device in env_devices:
             runners = _requested_runners(args, env_device)
             for runner in runners:
                 for feature_mode in feature_modes:
                     vision, olfaction = FEATURE_MODES[feature_mode]
                     if not _supports_feature_mode(env_device, vision, olfaction):
-                        print(
-                            "Skipping "
-                            f"ppo_device={ppo_device} env_device={env_device} "
-                            f"runner={runner} features={feature_mode}: "
-                            "unsupported feature mode.",
-                            flush=True,
-                        )
                         continue
-                    for num_envs in args.num_envs:
-                        for repeat in range(args.repeats):
-                            try:
-                                result = _run_trial(
-                                    args,
-                                    ppo_device,
-                                    env_device,
-                                    runner,
-                                    feature_mode,
-                                    vision,
-                                    olfaction,
-                                    num_envs,
-                                    repeat,
-                                )
-                            except SubprocWorkerError as exc:
-                                print(
-                                    "Aborting benchmark after subprocess worker failure: "
-                                    f"ppo_device={ppo_device} env_device={env_device} "
-                                    f"runner={runner} features={feature_mode} "
-                                    f"num_envs={num_envs} repeat={repeat}: {exc}",
-                                    flush=True,
-                                )
-                                if not args.continue_after_worker_failure:
-                                    raise SystemExit(1) from exc
-                                continue
-                            rows.append(result)
-                            _print_trial(result)
-                            _write_rows(args.output_csv, rows)
+                    for ccd_iterations in args.ccd_iterations:
+                        for num_envs in args.num_envs:
+                            for repeat in range(args.repeats):
+                                try:
+                                    result = _run_env_trial(
+                                        args,
+                                        ccd_iterations,
+                                        env_device,
+                                        runner,
+                                        feature_mode,
+                                        vision,
+                                        olfaction,
+                                        num_envs,
+                                        repeat,
+                                    )
+                                except SubprocWorkerError as exc:
+                                    _handle_worker_failure(
+                                        args,
+                                        exc,
+                                        benchmark_layer="env",
+                                        ppo_device="",
+                                        env_device=env_device,
+                                        runner=runner,
+                                        feature_mode=feature_mode,
+                                        num_envs=num_envs,
+                                        repeat=repeat,
+                                    )
+                                    continue
+                                rows.append(result)
+                                _print_trial(result)
+                                _write_rows(args.output_csv, rows)
+    if "raw" in args.benchmark_layers:
+        for num_envs in args.num_envs:
+            for repeat in range(args.repeats):
+                result = _run_raw_trial(args, num_envs, repeat)
+                rows.append(result)
+                _print_trial(result)
+                _write_rows(args.output_csv, rows)
     _print_summary(rows, args.output_csv)
+
+
+def _handle_worker_failure(
+    args: argparse.Namespace,
+    exc: SubprocWorkerError,
+    *,
+    benchmark_layer: str,
+    ppo_device: str,
+    env_device: str,
+    runner: str,
+    feature_mode: str,
+    num_envs: int,
+    repeat: int,
+) -> None:
+    print(
+        "Subprocess worker failure: "
+        f"layer={benchmark_layer} ppo_device={ppo_device} env_device={env_device} "
+        f"runner={runner} features={feature_mode} "
+        f"num_envs={num_envs} repeat={repeat}: {exc}",
+        flush=True,
+    )
+    if not args.continue_after_worker_failure:
+        raise SystemExit(1) from exc
 
 
 def _run_trial(
     args: argparse.Namespace,
+    ccd_iterations: int,
     ppo_device: str,
     env_device: str,
     runner: str,
@@ -243,6 +348,7 @@ def _run_trial(
     seed = args.seed + 10_000 * repeat + num_envs
     task_config = NavigationTaskConfig(
         timestep=args.timestep,
+        ccd_iterations=ccd_iterations,
         decision_steps=args.decision_steps,
         episode_time=args.episode_time,
         target_radius=args.target_radius,
@@ -268,47 +374,29 @@ def _run_trial(
         env_runner=runner,
         mp_start_method=args.mp_start_method,
     )
-    rollout_events = []
     _synchronize_devices(ppo_device, env_device)
     trial_started_at = time.perf_counter()
     construction_started_at = time.perf_counter()
-    trainer = PPOTrainer(NavigationTaskFactory(task_config), ppo_config)
+    env = make_navigation_vec_env(NavigationTaskFactory(task_config), ppo_config)
+    model = PPO("MlpPolicy", env, **ppo_config.sb3_kwargs())
     _synchronize_devices(ppo_device, env_device)
     construction_wall_seconds = time.perf_counter() - construction_started_at
-    worker_summary = _worker_diagnostics_summary(trainer.diagnostics())
     try:
         _synchronize_devices(ppo_device, env_device)
         train_started_at = time.perf_counter()
-        trainer.train(
-            metrics_callback=None,
-            progress_callback=rollout_events.append,
-            progress_interval_seconds=None,
-            eval_interval=None,
-        )
+        model.learn(total_timesteps=total_timesteps)
         _synchronize_devices(ppo_device, env_device)
         train_wall_seconds = time.perf_counter() - train_started_at
+        worker_summary = _worker_diagnostics_summary(env.diagnostics())
     finally:
-        trainer.close()
+        env.close()
     _synchronize_devices(ppo_device, env_device)
     total_wall_seconds = time.perf_counter() - trial_started_at
-    rollout_wall_seconds = sum(
-        event["rollout_wall_seconds"]
-        for event in rollout_events
-        if event["stage"] == "rollout_end"
-    )
-    rollout_end_events = [
-        event for event in rollout_events if event["stage"] == "rollout_end"
-    ]
-    rollout_decisions = sum(
-        event["rollout_timesteps"]
-        for event in rollout_end_events
-    )
-    update_wall_seconds = sum(
-        event["update_wall_seconds"]
-        for event in rollout_events
-        if event["stage"] == "update_end"
-    )
+    rollout_wall_seconds = train_wall_seconds
+    rollout_decisions = total_timesteps
     return BenchmarkResult(
+        benchmark_layer="ppo",
+        ccd_iterations=ccd_iterations,
         ppo_device=ppo_device,
         env_device=env_device,
         runner=runner,
@@ -325,9 +413,9 @@ def _run_trial(
         train_wall_seconds=train_wall_seconds,
         total_wall_seconds=total_wall_seconds,
         rollout_wall_seconds=rollout_wall_seconds,
-        update_wall_seconds=update_wall_seconds,
+        update_wall_seconds=0.0,
         rollout_decisions_per_second=_rate(rollout_decisions, rollout_wall_seconds),
-        update_decisions_per_second=_rate(total_timesteps, update_wall_seconds),
+        update_decisions_per_second=0.0,
         train_decisions_per_second=_rate(total_timesteps, train_wall_seconds),
         total_decisions_per_second=_rate(total_timesteps, total_wall_seconds),
         simulator_substeps_per_second=_rate(
@@ -338,42 +426,238 @@ def _run_trial(
             rollout_decisions * task_config.decision_interval,
             rollout_wall_seconds,
         ),
-        phase_obs_normalize_wall_seconds=_sum_event_field(
-            rollout_end_events, "phase_obs_normalize_wall_seconds"
+        worker_pid_count=worker_summary["worker_pid_count"],
+        worker_affinity_count_min=worker_summary["worker_affinity_count_min"],
+        worker_affinity_count_max=worker_summary["worker_affinity_count_max"],
+        worker_cpu_percent_sum=0.0,
+        worker_cpu_percent_mean=0.0,
+        worker_cpu_percent_max=0.0,
+        warp_devices=worker_summary["warp_devices"],
+        warp_cuda_devices=worker_summary["warp_cuda_devices"],
+        selected_warp_device=worker_summary["selected_warp_device"],
+        warp_cuda_graph_captured=worker_summary["warp_cuda_graph_captured"],
+        warp_last_action_source=worker_summary["warp_last_action_source"],
+        warp_step_count=int(worker_summary["warp_step_count"]),
+        warp_step_total_wall_seconds=worker_summary["warp_step_total_wall_seconds"],
+        warp_step_action_assign_wall_seconds=worker_summary[
+            "warp_step_action_assign_wall_seconds"
+        ],
+        warp_step_graph_launch_wall_seconds=worker_summary[
+            "warp_step_graph_launch_wall_seconds"
+        ],
+        warp_step_state_reward_wall_seconds=worker_summary[
+            "warp_step_state_reward_wall_seconds"
+        ],
+        warp_step_observation_wall_seconds=worker_summary[
+            "warp_step_observation_wall_seconds"
+        ],
+        warp_step_odor_wall_seconds=worker_summary["warp_step_odor_wall_seconds"],
+        warp_step_vision_wall_seconds=worker_summary["warp_step_vision_wall_seconds"],
+        warp_step_observation_assemble_wall_seconds=worker_summary[
+            "warp_step_observation_assemble_wall_seconds"
+        ],
+        warp_step_info_wall_seconds=worker_summary["warp_step_info_wall_seconds"],
+    )
+
+
+def _run_env_trial(
+    args: argparse.Namespace,
+    ccd_iterations: int,
+    env_device: str,
+    runner: str,
+    feature_mode: str,
+    vision: bool,
+    olfaction: bool,
+    num_envs: int,
+    repeat: int,
+) -> BenchmarkResult:
+    from flygym_demo.odor_obstacle_navigation.runners import make_task_runner
+
+    seed = args.seed + 10_000 * repeat + num_envs
+    task_config = NavigationTaskConfig(
+        timestep=args.timestep,
+        ccd_iterations=ccd_iterations,
+        decision_steps=args.decision_steps,
+        episode_time=args.episode_time,
+        target_radius=args.target_radius,
+        success_bonus=args.success_bonus,
+        progress_reward_weight=args.progress_reward_weight,
+        time_penalty=args.time_penalty,
+        randomize_layout=args.randomize_layout,
+        enable_vision=vision,
+        enable_olfaction=olfaction,
+        render=False,
+    )
+    total_decisions = args.rollouts * args.rollout_steps * num_envs
+    trial_started_at = time.perf_counter()
+    construction_started_at = time.perf_counter()
+    task_runner = make_task_runner(
+        NavigationTaskFactory(task_config),
+        num_envs=num_envs,
+        env_device=env_device,
+        env_runner=runner,
+        mp_start_method=args.mp_start_method,
+    )
+    construction_wall_seconds = time.perf_counter() - construction_started_at
+    try:
+        obs, _ = task_runner.reset(seed=seed)
+        del obs
+        action = np.zeros((num_envs, 2), dtype=np.float32)
+        rollout_started_at = time.perf_counter()
+        for _ in range(args.rollouts * args.rollout_steps):
+            _, _, terminated, truncated, _ = task_runner.step(action)
+            done_indices = np.flatnonzero(np.logical_or(terminated, truncated))
+            if done_indices.size:
+                task_runner.reset_at(done_indices)
+        _synchronize_devices("cpu", env_device)
+        rollout_wall_seconds = time.perf_counter() - rollout_started_at
+        diagnostics = {"workers": task_runner.diagnostics()}
+        worker_summary = _worker_diagnostics_summary(diagnostics)
+    finally:
+        task_runner.close()
+    total_wall_seconds = time.perf_counter() - trial_started_at
+    return BenchmarkResult(
+        benchmark_layer="env",
+        ccd_iterations=ccd_iterations,
+        ppo_device="",
+        env_device=env_device,
+        runner=runner,
+        mp_start_method=args.mp_start_method
+        if runner == "subproc" and env_device == "cpu"
+        else "",
+        feature_mode=feature_mode,
+        vision=vision,
+        olfaction=olfaction,
+        num_envs=num_envs,
+        repeat=repeat,
+        rollout_steps=args.rollout_steps,
+        rollouts=args.rollouts,
+        decision_steps=args.decision_steps,
+        construction_wall_seconds=construction_wall_seconds,
+        train_wall_seconds=rollout_wall_seconds,
+        total_wall_seconds=total_wall_seconds,
+        rollout_wall_seconds=rollout_wall_seconds,
+        update_wall_seconds=0.0,
+        rollout_decisions_per_second=_rate(total_decisions, rollout_wall_seconds),
+        update_decisions_per_second=0.0,
+        train_decisions_per_second=_rate(total_decisions, rollout_wall_seconds),
+        total_decisions_per_second=_rate(total_decisions, total_wall_seconds),
+        simulator_substeps_per_second=_rate(
+            total_decisions * args.decision_steps,
+            rollout_wall_seconds,
         ),
-        phase_policy_forward_wall_seconds=_sum_event_field(
-            rollout_end_events, "phase_policy_forward_wall_seconds"
-        ),
-        phase_action_transfer_wall_seconds=_sum_event_field(
-            rollout_end_events, "phase_action_transfer_wall_seconds"
-        ),
-        phase_env_step_wall_seconds=_sum_event_field(
-            rollout_end_events, "phase_env_step_wall_seconds"
-        ),
-        phase_reset_wall_seconds=_sum_event_field(
-            rollout_end_events, "phase_reset_wall_seconds"
-        ),
-        phase_bootstrap_wall_seconds=_sum_event_field(
-            rollout_end_events, "phase_bootstrap_wall_seconds"
-        ),
-        phase_advantage_wall_seconds=_sum_event_field(
-            rollout_end_events, "phase_advantage_wall_seconds"
-        ),
-        phase_tensorize_wall_seconds=_sum_event_field(
-            rollout_end_events, "phase_tensorize_wall_seconds"
+        simulated_seconds_per_second=_rate(
+            total_decisions * task_config.decision_interval,
+            rollout_wall_seconds,
         ),
         worker_pid_count=worker_summary["worker_pid_count"],
         worker_affinity_count_min=worker_summary["worker_affinity_count_min"],
         worker_affinity_count_max=worker_summary["worker_affinity_count_max"],
-        worker_cpu_percent_sum=_mean_event_field(
-            rollout_end_events, "worker_cpu_percent_sum"
-        ),
-        worker_cpu_percent_mean=_mean_event_field(
-            rollout_end_events, "worker_cpu_percent_mean"
-        ),
-        worker_cpu_percent_max=_mean_event_field(
-            rollout_end_events, "worker_cpu_percent_max"
-        ),
+        worker_cpu_percent_sum=0.0,
+        worker_cpu_percent_mean=0.0,
+        worker_cpu_percent_max=0.0,
+        warp_devices=worker_summary["warp_devices"],
+        warp_cuda_devices=worker_summary["warp_cuda_devices"],
+        selected_warp_device=worker_summary["selected_warp_device"],
+        warp_cuda_graph_captured=worker_summary["warp_cuda_graph_captured"],
+        warp_last_action_source=worker_summary["warp_last_action_source"],
+        warp_step_count=int(worker_summary["warp_step_count"]),
+        warp_step_total_wall_seconds=worker_summary["warp_step_total_wall_seconds"],
+        warp_step_action_assign_wall_seconds=worker_summary[
+            "warp_step_action_assign_wall_seconds"
+        ],
+        warp_step_graph_launch_wall_seconds=worker_summary[
+            "warp_step_graph_launch_wall_seconds"
+        ],
+        warp_step_state_reward_wall_seconds=worker_summary[
+            "warp_step_state_reward_wall_seconds"
+        ],
+        warp_step_observation_wall_seconds=worker_summary[
+            "warp_step_observation_wall_seconds"
+        ],
+        warp_step_odor_wall_seconds=worker_summary["warp_step_odor_wall_seconds"],
+        warp_step_vision_wall_seconds=worker_summary["warp_step_vision_wall_seconds"],
+        warp_step_observation_assemble_wall_seconds=worker_summary[
+            "warp_step_observation_assemble_wall_seconds"
+        ],
+        warp_step_info_wall_seconds=worker_summary["warp_step_info_wall_seconds"],
+    )
+
+
+def _run_raw_trial(
+    args: argparse.Namespace,
+    num_envs: int,
+    repeat: int,
+) -> BenchmarkResult:
+    from flygym.compose import ActuatorType
+    from flygym_demo.benchmark.time_gpu_simulation import (
+        ReplayTargetData,
+        make_model,
+        run_simulation,
+    )
+
+    ref_fly, *_ = make_model()
+    jointdofs_order = ref_fly.get_actuated_jointdofs_order(ActuatorType.POSITION)
+    replay_data = ReplayTargetData(args.timestep, jointdofs_order)
+    sim_steps = args.rollouts * args.rollout_steps * args.decision_steps
+    target_angles = replay_data.make_target_angles_all_worlds(num_envs, sim_steps)
+    trial_started_at = time.perf_counter()
+    wall_seconds = run_simulation(
+        target_angles,
+        enable_rendering=False,
+        timestep=args.timestep,
+        simplify_geom=False,
+    )
+    total_wall_seconds = time.perf_counter() - trial_started_at
+    substeps = sim_steps * num_envs
+    decision_equivalents = args.rollouts * args.rollout_steps * num_envs
+    return BenchmarkResult(
+        benchmark_layer="raw",
+        ccd_iterations=0,
+        ppo_device="",
+        env_device="cuda",
+        runner="raw",
+        mp_start_method="",
+        feature_mode="raw",
+        vision=False,
+        olfaction=False,
+        num_envs=num_envs,
+        repeat=repeat,
+        rollout_steps=args.rollout_steps,
+        rollouts=args.rollouts,
+        decision_steps=args.decision_steps,
+        construction_wall_seconds=total_wall_seconds - wall_seconds,
+        train_wall_seconds=wall_seconds,
+        total_wall_seconds=total_wall_seconds,
+        rollout_wall_seconds=wall_seconds,
+        update_wall_seconds=0.0,
+        rollout_decisions_per_second=_rate(decision_equivalents, wall_seconds),
+        update_decisions_per_second=0.0,
+        train_decisions_per_second=_rate(decision_equivalents, wall_seconds),
+        total_decisions_per_second=_rate(decision_equivalents, total_wall_seconds),
+        simulator_substeps_per_second=_rate(substeps, wall_seconds),
+        simulated_seconds_per_second=_rate(substeps * args.timestep, wall_seconds),
+        worker_pid_count=0,
+        worker_affinity_count_min=0,
+        worker_affinity_count_max=0,
+        worker_cpu_percent_sum=0.0,
+        worker_cpu_percent_mean=0.0,
+        worker_cpu_percent_max=0.0,
+        warp_devices=",".join(_warp_device_names()),
+        warp_cuda_devices=",".join(_warp_cuda_device_names()),
+        selected_warp_device="",
+        warp_cuda_graph_captured="raw",
+        warp_last_action_source="",
+        warp_step_count=0,
+        warp_step_total_wall_seconds=0.0,
+        warp_step_action_assign_wall_seconds=0.0,
+        warp_step_graph_launch_wall_seconds=0.0,
+        warp_step_state_reward_wall_seconds=0.0,
+        warp_step_observation_wall_seconds=0.0,
+        warp_step_odor_wall_seconds=0.0,
+        warp_step_vision_wall_seconds=0.0,
+        warp_step_observation_assemble_wall_seconds=0.0,
+        warp_step_info_wall_seconds=0.0,
     )
 
 
@@ -399,11 +683,17 @@ def _system_summary(
         "mujoco_gl": os.environ["MUJOCO_GL"],
         "pyopengl_platform": os.environ["PYOPENGL_PLATFORM"],
         "decision_steps": args.decision_steps,
+        "ccd_iterations": args.ccd_iterations,
         "rollout_steps": args.rollout_steps,
         "rollouts": args.rollouts,
+        "benchmark_layers": args.benchmark_layers,
         "ppo_devices": ppo_devices,
         "env_devices": env_devices,
         "feature_modes": feature_modes,
+        "warp": {
+            "devices": _warp_device_names(),
+            "cuda_devices": _warp_cuda_device_names(),
+        },
         "torch": {
             "version": torch.__version__,
             "cuda_available": torch.cuda.is_available(),
@@ -417,8 +707,10 @@ def _system_summary(
 
 
 def _print_trial(result: BenchmarkResult) -> None:
-    print(
-        "ppo={ppo:<7} env={env:<4} runner={runner:<7} envs={envs:<4} repeat={repeat:<2} "
+    message = (
+        "layer={layer:<3} ccd={ccd:<4} ppo={ppo:<7} env={env:<4} "
+        "runner={runner:<7} "
+        "envs={envs:<4} repeat={repeat:<2} "
         "features={features:<11} "
         "rollout_dec/s={rollout_decisions_per_second:>8.2f} "
         "update_dec/s={update_decisions_per_second:>8.2f} "
@@ -429,6 +721,8 @@ def _print_trial(result: BenchmarkResult) -> None:
         "construct={construction_wall_seconds:>6.2f}s "
         "update={update_wall_seconds:>6.2f}s "
         "train={train_wall_seconds:>6.2f}s".format(
+            layer=result.benchmark_layer,
+            ccd=result.ccd_iterations,
             ppo=result.ppo_device,
             env=result.env_device,
             runner=result.runner,
@@ -444,9 +738,55 @@ def _print_trial(result: BenchmarkResult) -> None:
             construction_wall_seconds=result.construction_wall_seconds,
             update_wall_seconds=result.update_wall_seconds,
             train_wall_seconds=result.train_wall_seconds,
-        ),
-        flush=True,
+        )
     )
+    if result.warp_step_count:
+        message += (
+            " warp_step_ms={step_ms:>7.2f} "
+            "assign_ms={assign_ms:>6.2f} "
+            "launch_ms={launch_ms:>6.2f} "
+            "state_ms={state_ms:>6.2f} "
+            "odor_ms={odor_ms:>6.2f} "
+            "vision_ms={vision_ms:>6.2f} "
+            "obs_asm_ms={obs_asm_ms:>6.2f} "
+            "info_ms={info_ms:>6.2f} "
+            "action={action_source}"
+        ).format(
+            step_ms=_milliseconds_per_step(
+                result.warp_step_total_wall_seconds,
+                result.warp_step_count,
+            ),
+            assign_ms=_milliseconds_per_step(
+                result.warp_step_action_assign_wall_seconds,
+                result.warp_step_count,
+            ),
+            launch_ms=_milliseconds_per_step(
+                result.warp_step_graph_launch_wall_seconds,
+                result.warp_step_count,
+            ),
+            state_ms=_milliseconds_per_step(
+                result.warp_step_state_reward_wall_seconds,
+                result.warp_step_count,
+            ),
+            odor_ms=_milliseconds_per_step(
+                result.warp_step_odor_wall_seconds,
+                result.warp_step_count,
+            ),
+            vision_ms=_milliseconds_per_step(
+                result.warp_step_vision_wall_seconds,
+                result.warp_step_count,
+            ),
+            obs_asm_ms=_milliseconds_per_step(
+                result.warp_step_observation_assemble_wall_seconds,
+                result.warp_step_count,
+            ),
+            info_ms=_milliseconds_per_step(
+                result.warp_step_info_wall_seconds,
+                result.warp_step_count,
+            ),
+            action_source=result.warp_last_action_source or "-",
+        )
+    print(message, flush=True)
 
 
 def _write_rows(path: Path, rows: list[BenchmarkResult]) -> None:
@@ -462,10 +802,14 @@ def _print_summary(rows: list[BenchmarkResult], path: Path) -> None:
     if not rows:
         print(f"\nNo benchmark rows were produced; no CSV was written to {path}")
         return
-    groups: dict[tuple[str, str, str, str, str, int], list[BenchmarkResult]] = {}
+    groups: dict[
+        tuple[str, int, str, str, str, str, str, int], list[BenchmarkResult]
+    ] = {}
     for row in rows:
         groups.setdefault(
             (
+                row.benchmark_layer,
+                row.ccd_iterations,
                 row.ppo_device,
                 row.env_device,
                 row.runner,
@@ -477,6 +821,8 @@ def _print_summary(rows: list[BenchmarkResult], path: Path) -> None:
         ).append(row)
     summary = []
     for (
+        benchmark_layer,
+        ccd_iterations,
         ppo_device,
         env_device,
         runner,
@@ -487,6 +833,8 @@ def _print_summary(rows: list[BenchmarkResult], path: Path) -> None:
         summary.append(
             {
                 "ppo_device": ppo_device,
+                "benchmark_layer": benchmark_layer,
+                "ccd_iterations": ccd_iterations,
                 "env_device": env_device,
                 "runner": runner,
                 "mp_start_method": mp_start_method,
@@ -510,14 +858,16 @@ def _print_summary(rows: list[BenchmarkResult], path: Path) -> None:
             }
         )
     summary.sort(
-        key=lambda row: row["mean_train_decisions_per_second"],
+        key=lambda row: row["mean_simulator_substeps_per_second"],
         reverse=True,
     )
     print(f"\nWrote benchmark rows to {path}")
-    print("Top configurations by train decisions/s:")
+    print("Top configurations by simulator substeps/s:")
     for row in summary[:10]:
         print(
-            "ppo={ppo:<7} env={env:<4} runner={runner:<7} start={start:<10} envs={envs:<4} "
+            "layer={layer:<3} ccd={ccd:<4} ppo={ppo:<7} env={env:<4} "
+            "runner={runner:<7} "
+            "start={start:<10} envs={envs:<4} "
             "features={features:<11} "
             "rollout_dec/s={rollout_decisions_per_second:>8.2f} "
             "update_dec/s={update_decisions_per_second:>8.2f} "
@@ -525,6 +875,8 @@ def _print_summary(rows: list[BenchmarkResult], path: Path) -> None:
             "total_dec/s={total_decisions_per_second:>8.2f} "
             "substeps/s={substeps_per_second:>10.0f} "
             .format(
+                layer=row["benchmark_layer"],
+                ccd=row["ccd_iterations"],
                 ppo=row["ppo_device"],
                 env=row["env_device"],
                 runner=row["runner"],
@@ -614,7 +966,7 @@ def _cuda_device_names() -> list[str]:
     return [torch.cuda.get_device_name(idx) for idx in range(torch.cuda.device_count())]
 
 
-def _worker_diagnostics_summary(diagnostics: dict) -> dict[str, int]:
+def _worker_diagnostics_summary(diagnostics: dict) -> dict[str, int | float | str]:
     workers = diagnostics.get("workers", [])
     pids = {
         int(worker["pid"])
@@ -626,24 +978,83 @@ def _worker_diagnostics_summary(diagnostics: dict) -> dict[str, int]:
         for worker in workers
         if isinstance(worker, dict) and worker.get("cpu_affinity_count") is not None
     ]
+    warp_devices = _join_unique_worker_values(workers, "warp_devices")
+    warp_cuda_devices = _join_unique_worker_values(workers, "warp_cuda_devices")
+    selected_warp_device = _join_unique_worker_values(workers, "selected_warp_device")
+    warp_timing_fields = [
+        "warp_step_total_wall_seconds",
+        "warp_step_action_assign_wall_seconds",
+        "warp_step_graph_launch_wall_seconds",
+        "warp_step_state_reward_wall_seconds",
+        "warp_step_observation_wall_seconds",
+        "warp_step_odor_wall_seconds",
+        "warp_step_vision_wall_seconds",
+        "warp_step_observation_assemble_wall_seconds",
+        "warp_step_info_wall_seconds",
+    ]
     return {
         "worker_pid_count": len(pids),
         "worker_affinity_count_min": min(affinity_counts) if affinity_counts else 0,
         "worker_affinity_count_max": max(affinity_counts) if affinity_counts else 0,
+        "warp_devices": warp_devices,
+        "warp_cuda_devices": warp_cuda_devices,
+        "selected_warp_device": selected_warp_device,
+        "warp_cuda_graph_captured": _join_unique_worker_values(
+            workers, "warp_cuda_graph_captured"
+        ),
+        "warp_last_action_source": _join_unique_worker_values(
+            workers, "warp_last_action_source"
+        ),
+        "warp_step_count": int(_sum_worker_numeric_values(workers, "warp_step_count")),
+        **{
+            field: _sum_worker_numeric_values(workers, field)
+            for field in warp_timing_fields
+        },
     }
 
 
-def _sum_event_field(events: list[dict], field: str) -> float:
-    return float(sum(float(event.get(field, 0.0) or 0.0) for event in events))
+def _join_unique_worker_values(workers: list[dict], key: str) -> str:
+    values = []
+    for worker in workers:
+        if not isinstance(worker, dict):
+            continue
+        value = worker.get(key)
+        if isinstance(value, list):
+            values.extend(str(item) for item in value)
+        elif value:
+            values.append(str(value))
+    return ",".join(dict.fromkeys(values))
 
 
-def _mean_event_field(events: list[dict], field: str) -> float:
-    values = [
-        float(event[field])
-        for event in events
-        if event.get(field) is not None
-    ]
-    return float(statistics.mean(values)) if values else 0.0
+def _sum_worker_numeric_values(workers: list[dict], key: str) -> float:
+    total = 0.0
+    for worker in workers:
+        if not isinstance(worker, dict):
+            continue
+        value = worker.get(key)
+        if value is not None:
+            total += float(value)
+    return total
+
+
+def _milliseconds_per_step(wall_seconds: float, step_count: int) -> float:
+    return _rate(wall_seconds * 1000.0, step_count)
+
+
+def _warp_device_names() -> list[str]:
+    try:
+        import warp as wp
+    except ImportError:
+        return []
+    return [str(device) for device in wp.get_devices()]
+
+
+def _warp_cuda_device_names() -> list[str]:
+    try:
+        import warp as wp
+    except ImportError:
+        return []
+    return [str(device) for device in wp.get_devices() if device.is_cuda]
 
 
 def _rate(numerator: float, denominator: float) -> float:

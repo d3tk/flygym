@@ -36,6 +36,8 @@ dependencies = [
     "numba>=0.65.1",
     "torch>=2.12.0",
     "wandb[examples]>=0.27.0",
+    "gymnasium>=1.2,<1.4",
+    "stable-baselines3>=2.8,<2.9",
 ]
 
 [project.optional-dependencies]
