@@ -25,9 +25,15 @@ from flygym_demo.odor_obstacle_navigation.task import (
     NavigationTaskConfig,
     _compute_ommatidia_coms,
     _empty_vision_features,
+    _finite_float32,
+    _heading_from_quat_wxyz,
+    _odor_intensity_from_sources,
     _odor_by_side,
     _project_action_norm,
+    _sample_navigation_layout,
     _yaw_to_quat_wxyz,
+    compute_motion_diagnostics,
+    navigation_policy_action_from_raw,
 )
 from flygym_demo.odor_obstacle_navigation.world import ObstacleOdorWorld
 
@@ -71,6 +77,23 @@ def _set_root_state_kernel(
     qvel[world_idx, root_qveladr + 3] = 0.0
     qvel[world_idx, root_qveladr + 4] = 0.0
     qvel[world_idx, root_qveladr + 5] = 0.0
+
+
+@wp.kernel
+def _set_mocap_positions_kernel(
+    mocap_pos: wp.array2d(dtype=wp.vec3),
+    rows: wp.array(dtype=wp.int32),
+    mocap_ids: wp.array(dtype=wp.int32),
+    positions: wp.array3d(dtype=wp.float32),
+):
+    row_idx, item_idx = wp.tid()
+    world_idx = rows[row_idx]
+    mocap_id = mocap_ids[item_idx]
+    mocap_pos[world_idx, mocap_id] = wp.vec3(
+        positions[row_idx, item_idx, 0],
+        positions[row_idx, item_idx, 1],
+        positions[row_idx, item_idx, 2],
+    )
 
 
 @wp.kernel
@@ -232,10 +255,6 @@ class WarpNavigationTaskRunner:
     def __init__(self, config: NavigationTaskConfig, num_envs: int) -> None:
         self._require_cuda_device()
         self.config = deepcopy(config)
-        if self.config.randomize_layout:
-            raise NotImplementedError(
-                "WarpNavigationTaskRunner currently requires a fixed layout."
-            )
         if self.config.render:
             raise NotImplementedError("WarpNavigationTaskRunner does not render.")
         self.num_envs = int(num_envs)
@@ -282,6 +301,18 @@ class WarpNavigationTaskRunner:
             raise RuntimeError(f"Expected a CUDA Warp device, got {self._wp_device}.")
 
         self._root_qposadr, self._root_qveladr = self._find_root_addresses()
+        self._odor_mocap_ids = self._cache_mocap_ids(
+            self.world.odor_marker_body_full_identifiers()
+        )
+        self._obstacle_mocap_ids = self._cache_mocap_ids(
+            self.world.obstacle_body_full_identifiers()
+        )
+        self._odor_mocap_ids_wp = wp.array(
+            self._odor_mocap_ids, dtype=wp.int32, device=self._wp_device
+        )
+        self._obstacle_mocap_ids_wp = wp.array(
+            self._obstacle_mocap_ids, dtype=wp.int32, device=self._wp_device
+        )
         self._thorax_body_idx = self.fly.get_bodysegs_order().index(
             BodySegment("c_thorax")
         )
@@ -308,11 +339,20 @@ class WarpNavigationTaskRunner:
         self._decision_counts = np.zeros(self.num_envs, dtype=np.int32)
         self._prev_distance_to_target = np.zeros(self.num_envs, dtype=np.float32)
         self._prev_object_size = np.zeros(self.num_envs, dtype=np.float32)
+        self._prev_fly_xy = np.zeros((self.num_envs, 2), dtype=np.float32)
+        self._prev_heading = np.zeros(self.num_envs, dtype=np.float32)
+        self._prev_policy_action_idx = np.full(self.num_envs, -1, dtype=np.int32)
+        self._has_motion_history = np.zeros(self.num_envs, dtype=bool)
         self.current_odor_source = np.repeat(
             self.config.odor_source[np.newaxis, :, :], self.num_envs, axis=0
         )
         self.current_obstacle_positions = np.repeat(
             self.config.obstacle_positions[np.newaxis, :, :], self.num_envs, axis=0
+        )
+        self.current_active_obstacle_counts = np.full(
+            self.num_envs,
+            self.config.obstacle_positions.shape[0],
+            dtype=np.int32,
         )
         self._diagnostic_step_count = 0
         self._diagnostic_wall_seconds = {
@@ -353,10 +393,15 @@ class WarpNavigationTaskRunner:
         spawn_positions = np.empty((len(indices), 3), dtype=np.float32)
         spawn_quats = np.empty((len(indices), 4), dtype=np.float32)
         for row, (env_idx, seed) in enumerate(zip(indices, seeds, strict=True)):
+            env_idx = int(env_idx)
             if seed is not None:
-                self._rngs[int(env_idx)] = np.random.default_rng(seed)
-            spawn_positions[row] = self.config.spawn_position
-            spawn_quats[row] = _yaw_to_quat_wxyz(self.config.spawn_yaw)
+                self._rngs[env_idx] = np.random.default_rng(seed)
+            layout = _sample_navigation_layout(self.config, self._rngs[env_idx])
+            spawn_positions[row] = layout.spawn_position
+            spawn_quats[row] = _yaw_to_quat_wxyz(layout.spawn_yaw)
+            self.current_odor_source[env_idx] = layout.odor_source
+            self.current_obstacle_positions[env_idx] = layout.obstacle_positions
+            self.current_active_obstacle_counts[env_idx] = layout.active_obstacle_count
 
         rows_wp = wp.array(indices, dtype=wp.int32)
         self._copy_rows(self.sim.mjw_data.qpos, rows_wp, self._neutral_qpos)
@@ -375,6 +420,7 @@ class WarpNavigationTaskRunner:
                 self._root_qveladr,
             ],
         )
+        self._set_layout_mocaps(indices, rows_wp)
         self._forward()
 
         self.controller.reset_at(indices, seeds)
@@ -384,6 +430,10 @@ class WarpNavigationTaskRunner:
         self._prev_distance_to_target[indices] = self._distance_to_target(
             fly_positions, indices
         )
+        self._prev_fly_xy[indices] = fly_positions[:, :2]
+        self._prev_heading[indices] = self._fly_headings()[indices]
+        self._prev_policy_action_idx[indices] = -1
+        self._has_motion_history[indices] = False
         observations, features = self._make_observations(indices=indices)
         infos = [
             self._make_info(
@@ -396,6 +446,11 @@ class WarpNavigationTaskRunner:
                 False,
                 fly_position=fly_positions[row],
                 distance=float(self._prev_distance_to_target[int(env_idx)]),
+                forward_speed=0.0,
+                yaw_rate=0.0,
+                policy_action_idx=None,
+                policy_action_label="",
+                switched_action=False,
             )
             for row, env_idx in enumerate(indices)
         ]
@@ -406,7 +461,9 @@ class WarpNavigationTaskRunner:
         actions: Any,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[dict[str, Any]]]:
         step_started_at = time.perf_counter()
+        raw_actions = actions
         actions = self._resolve_actions(actions)
+        policy_action_meta = self._policy_action_metadata(raw_actions)
 
         phase_started_at = time.perf_counter()
         self._last_action_source = self._assign_actions(actions)
@@ -420,6 +477,7 @@ class WarpNavigationTaskRunner:
         indices = np.arange(self.num_envs, dtype=np.int32)
         self._decision_counts += 1
         fly_positions = self._fly_positions()
+        headings = self._fly_headings()
         distances = self._distance_to_target(fly_positions, indices)
         successes = distances <= self.config.target_radius
         progress = self._prev_distance_to_target - distances
@@ -441,20 +499,57 @@ class WarpNavigationTaskRunner:
         )
 
         phase_started_at = time.perf_counter()
-        infos = [
-            self._make_info(
-                int(env_idx),
-                features[row],
-                float(self.config.progress_reward_weight * progress[env_idx]),
-                float(-self.config.time_penalty),
-                float(self.config.success_bonus if terminated[env_idx] else 0.0),
-                bool(terminated[env_idx]),
-                bool(truncated[env_idx]),
-                fly_position=fly_positions[env_idx],
-                distance=float(distances[env_idx]),
+        current_fly_xy = fly_positions[:, :2]
+        infos = []
+        for row, env_idx in enumerate(indices):
+            env_idx = int(env_idx)
+            if self._has_motion_history[env_idx]:
+                forward_speed, yaw_rate = compute_motion_diagnostics(
+                    self._prev_fly_xy[env_idx],
+                    float(self._prev_heading[env_idx]),
+                    current_fly_xy[env_idx],
+                    float(headings[env_idx]),
+                    self.config.decision_interval,
+                )
+            else:
+                forward_speed, yaw_rate = 0.0, 0.0
+            policy_action_idx, policy_action_label = policy_action_meta[env_idx]
+            switched_action = (
+                policy_action_idx is not None
+                and self._prev_policy_action_idx[env_idx] >= 0
+                and policy_action_idx != self._prev_policy_action_idx[env_idx]
             )
-            for row, env_idx in enumerate(indices)
-        ]
+            low_level_action = None
+            if self.action_space == "continuous":
+                low_level_action = {
+                    "left_force": float(actions[env_idx, 0]),
+                    "right_force": float(actions[env_idx, 1]),
+                    "groom": False,
+                }
+            infos.append(
+                self._make_info(
+                    env_idx,
+                    features[row],
+                    float(self.config.progress_reward_weight * progress[env_idx]),
+                    float(-self.config.time_penalty),
+                    float(self.config.success_bonus if terminated[env_idx] else 0.0),
+                    bool(terminated[env_idx]),
+                    bool(truncated[env_idx]),
+                    fly_position=fly_positions[env_idx],
+                    distance=float(distances[env_idx]),
+                    forward_speed=forward_speed,
+                    yaw_rate=yaw_rate,
+                    policy_action_idx=policy_action_idx,
+                    policy_action_label=policy_action_label,
+                    switched_action=switched_action,
+                    low_level_action=low_level_action,
+                )
+            )
+            if policy_action_idx is not None:
+                self._prev_policy_action_idx[env_idx] = policy_action_idx
+        self._prev_fly_xy = current_fly_xy.astype(np.float32)
+        self._prev_heading = headings.astype(np.float32)
+        self._has_motion_history[:] = True
         self._record_diagnostic_time("info", phase_started_at)
         self._diagnostic_step_count += 1
         self._record_diagnostic_time("total_step", step_started_at)
@@ -598,6 +693,38 @@ class WarpNavigationTaskRunner:
             inputs=[dst, rows_wp, wp.array(values, dtype=wp.float32)],
         )
 
+    def _set_layout_mocaps(self, indices: np.ndarray, rows_wp) -> None:
+        self._set_mocap_positions(
+            rows_wp,
+            self._odor_mocap_ids_wp,
+            self.current_odor_source[indices].astype(np.float32, copy=False),
+        )
+        obstacle_positions = np.empty(
+            (len(indices), self.current_obstacle_positions.shape[1], 3),
+            dtype=np.float32,
+        )
+        obstacle_positions[:, :, :2] = self.current_obstacle_positions[indices]
+        obstacle_positions[:, :, 2] = self.config.obstacle_height / 2
+        self._set_mocap_positions(
+            rows_wp,
+            self._obstacle_mocap_ids_wp,
+            obstacle_positions,
+        )
+
+    def _set_mocap_positions(self, rows_wp, mocap_ids_wp, positions: np.ndarray) -> None:
+        if mocap_ids_wp.shape[0] == 0:
+            return
+        wp.launch(
+            _set_mocap_positions_kernel,
+            dim=(rows_wp.shape[0], mocap_ids_wp.shape[0]),
+            inputs=[
+                self.sim.mjw_data.mocap_pos,
+                rows_wp,
+                mocap_ids_wp,
+                wp.array(positions, dtype=wp.float32, device=self._wp_device),
+            ],
+        )
+
     def _forward(self) -> None:
         mjw.forward(self.sim.mjw_model, self.sim.mjw_data)
 
@@ -617,9 +744,52 @@ class WarpNavigationTaskRunner:
             int(self.sim.mj_model.jnt_dofadr[joint_id]),
         )
 
+    def _cache_mocap_ids(self, body_names: list[str]) -> np.ndarray:
+        mocap_ids = []
+        for body_name in body_names:
+            body_id = mj.mj_name2id(
+                self.sim.mj_model,
+                mj.mjtObj.mjOBJ_BODY,
+                body_name,
+            )
+            mocap_id = int(self.sim.mj_model.body_mocapid[body_id])
+            if mocap_id < 0:
+                raise RuntimeError(f"Expected mocap body for {body_name!r}.")
+            mocap_ids.append(mocap_id)
+        return np.asarray(mocap_ids, dtype=np.int32)
+
     def _fly_positions(self) -> np.ndarray:
         body_positions = self.sim.get_body_positions(self.fly.name).numpy()
         return body_positions[:, self._thorax_body_idx, :].astype(np.float32)
+
+    def _fly_headings(self) -> np.ndarray:
+        qpos = self.sim.mjw_data.qpos.numpy()
+        quats = qpos[:, self._root_qposadr + 3 : self._root_qposadr + 7]
+        return np.asarray(
+            [_heading_from_quat_wxyz(quat) for quat in quats],
+            dtype=np.float32,
+        )
+
+    def _policy_action_metadata(
+        self, raw_actions: Any
+    ) -> list[tuple[int | None, str]]:
+        if self.action_space == "continuous":
+            return [(None, "low_level") for _ in range(self.num_envs)]
+        if raw_actions.__class__.__module__.startswith("torch"):
+            action_indices = raw_actions.detach().cpu().numpy()
+        else:
+            action_indices = np.asarray(raw_actions)
+        if action_indices.shape == (self.num_envs, 1):
+            action_indices = action_indices[:, 0]
+        metadata: list[tuple[int | None, str]] = []
+        for action in action_indices:
+            metadata.append(
+                navigation_policy_action_from_raw(
+                    action,
+                    action_space=self.action_space,
+                )
+            )
+        return metadata
 
     def _distance_to_target(
         self, fly_positions: np.ndarray, indices: np.ndarray
@@ -635,6 +805,7 @@ class WarpNavigationTaskRunner:
         )
         phase_started_at = time.perf_counter()
         odor = self._odor_features(indices)
+        odor = _finite_float32(odor)
         if record_diagnostics:
             self._record_diagnostic_time("odor", phase_started_at)
         phase_started_at = time.perf_counter()
@@ -645,8 +816,8 @@ class WarpNavigationTaskRunner:
         features = []
         for row in range(len(indices)):
             vision_features = vision[row]
-            com_per_eye = np.nan_to_num(vision_features["com_per_eye"], nan=0.0)
-            size_per_eye = vision_features["size_per_eye"]
+            com_per_eye = _finite_float32(vision_features["com_per_eye"])
+            size_per_eye = _finite_float32(vision_features["size_per_eye"])
             observations[row] = np.array(
                 [
                     odor[row, 0],
@@ -660,6 +831,7 @@ class WarpNavigationTaskRunner:
                 ],
                 dtype=np.float32,
             )
+            observations[row] = _finite_float32(observations[row])
             features.append(
                 {
                     "odor_left": float(odor[row, 0]),
@@ -771,6 +943,7 @@ class WarpNavigationTaskRunner:
         self, env_idx: int, summary: np.ndarray
     ) -> dict[str, Any]:
         assert self._retina is not None
+        summary = _finite_float32(summary)
         counts = summary[:, 2]
         if counts.sum() == 0:
             self._prev_object_size[env_idx] = 0.0
@@ -838,9 +1011,14 @@ class WarpNavigationTaskRunner:
         site_positions = self.sim.mjw_data.site_xpos.numpy()
         odor = np.zeros((len(indices), 2), dtype=np.float32)
         for row, env_idx in enumerate(indices):
-            sensor_positions = site_positions[int(env_idx), self._olfaction_site_ids, :]
+            env_idx = int(env_idx)
+            sensor_positions = site_positions[env_idx, self._olfaction_site_ids, :]
             odor[row] = _odor_by_side(
-                self.world.get_olfaction(sensor_positions),
+                _odor_intensity_from_sources(
+                    sensor_positions,
+                    self.current_odor_source[env_idx],
+                    self.config.peak_odor_intensity,
+                ),
                 self.config.odor_palps_antennae_weights,
             )
         return odor
@@ -856,6 +1034,12 @@ class WarpNavigationTaskRunner:
         truncated: bool,
         fly_position: np.ndarray | None = None,
         distance: float | None = None,
+        forward_speed: float = 0.0,
+        yaw_rate: float = 0.0,
+        policy_action_idx: int | None = None,
+        policy_action_label: str = "",
+        switched_action: bool = False,
+        low_level_action: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if fly_position is None:
             fly_position = self._fly_positions()[env_idx]
@@ -871,7 +1055,7 @@ class WarpNavigationTaskRunner:
             "success": float(success_reward),
             "total": float(progress_reward + time_reward + success_reward),
         }
-        return {
+        info = {
             "sim_time": float(
                 self._decision_counts[env_idx] * self.config.decision_interval
             ),
@@ -879,13 +1063,27 @@ class WarpNavigationTaskRunner:
             "fly_position": fly_position.copy(),
             "target_position": self.current_odor_source[env_idx, 0].copy(),
             "obstacle_positions": self.current_obstacle_positions[env_idx].copy(),
+            "active_obstacle_count": int(self.current_active_obstacle_counts[env_idx]),
+            "active_obstacle_positions": self.current_obstacle_positions[
+                env_idx, : self.current_active_obstacle_counts[env_idx]
+            ].copy(),
             "distance_to_target": distance,
             "processed_features": features,
             "reward_terms": reward_terms,
             "success": bool(terminated),
+            "is_success": bool(terminated),
             "terminated": bool(terminated),
             "truncated": bool(truncated),
+            "forward_speed": float(forward_speed),
+            "yaw_rate": float(yaw_rate),
+            "policy_action": policy_action_idx,
+            "policy_action_label": policy_action_label,
+            "switched_action": bool(switched_action),
+            "failure_reason": None,
         }
+        if low_level_action is not None:
+            info["low_level_action"] = low_level_action
+        return info
 
 
 class _GPUOpenLoopTurningController:

@@ -19,6 +19,7 @@ from flygym_demo.odor_obstacle_navigation.task import (
     NavigationTaskConfig,
     NavigationTaskFactory,
     OdorObstacleNavigationTask,
+    _odor_intensity_from_sources,
     resolve_navigation_action,
 )
 from flygym_demo.odor_obstacle_navigation.world import ObstacleOdorWorld
@@ -39,6 +40,37 @@ def _fast_config(**kwargs) -> NavigationTaskConfig:
     }
     defaults.update(kwargs)
     return NavigationTaskConfig(**defaults)
+
+
+def _assert_layout_clearances(info: dict, config: NavigationTaskConfig) -> None:
+    spawn_xy = config.spawn_position[:2]
+    target_xy = info["target_position"][:2]
+    active_obstacles = info["active_obstacle_positions"]
+
+    assert (
+        np.linalg.norm(target_xy - spawn_xy)
+        >= config.layout_min_target_spawn_distance
+    )
+    if active_obstacles.size == 0:
+        return
+
+    assert np.all(
+        np.linalg.norm(active_obstacles - spawn_xy, axis=1)
+        >= config.layout_min_obstacle_spawn_distance
+    )
+    assert np.all(
+        np.linalg.norm(active_obstacles - target_xy, axis=1)
+        >= config.layout_min_obstacle_target_distance
+    )
+    for obstacle_idx in range(active_obstacles.shape[0] - 1):
+        assert np.all(
+            np.linalg.norm(
+                active_obstacles[obstacle_idx + 1 :]
+                - active_obstacles[obstacle_idx],
+                axis=1,
+            )
+            >= config.layout_min_obstacle_obstacle_distance
+        )
 
 
 def test_obstacle_world_adds_contact_pairs_for_obstacles():
@@ -197,8 +229,114 @@ def test_seeded_layouts_are_deterministic():
             info_a["obstacle_positions"],
             info_b["obstacle_positions"],
         )
+        assert info_a["active_obstacle_count"] == info_b["active_obstacle_count"]
+        np.testing.assert_allclose(
+            info_a["active_obstacle_positions"],
+            info_b["active_obstacle_positions"],
+        )
     finally:
         task.close()
+
+
+def test_default_randomized_layout_keeps_all_obstacle_slots_active():
+    config = _fast_config(
+        enable_olfaction=False,
+        randomize_layout=True,
+        obstacle_positions=np.array([[7.5, 0.0], [12.5, 5.0]], dtype=float),
+    )
+    task = OdorObstacleNavigationTask(config)
+    try:
+        _, info = task.reset(seed=11)
+
+        assert info["active_obstacle_count"] == 2
+        np.testing.assert_allclose(
+            info["active_obstacle_positions"],
+            info["obstacle_positions"],
+        )
+    finally:
+        task.close()
+
+
+def test_count_range_layout_parks_inactive_obstacle_slots():
+    inactive_position = np.array([1000.0, 0.0], dtype=float)
+    config = _fast_config(
+        enable_olfaction=False,
+        randomize_layout=True,
+        spawn_xy_jitter=0.0,
+        spawn_yaw_jitter=0.0,
+        obstacle_positions=np.zeros((5, 2), dtype=float),
+        obstacle_count_range=(3, 3),
+        inactive_obstacle_position=inactive_position,
+        layout_min_target_spawn_distance=10.0,
+        layout_min_obstacle_spawn_distance=3.0,
+        layout_min_obstacle_target_distance=4.0,
+        layout_min_obstacle_obstacle_distance=4.0,
+    )
+    task = OdorObstacleNavigationTask(config)
+    try:
+        _, info = task.reset(seed=12)
+
+        assert info["active_obstacle_count"] == 3
+        assert info["active_obstacle_positions"].shape == (3, 2)
+        np.testing.assert_allclose(
+            info["obstacle_positions"][3:],
+            np.repeat(inactive_position[np.newaxis, :], 2, axis=0),
+        )
+        _assert_layout_clearances(info, config)
+    finally:
+        task.close()
+
+
+def test_count_range_layout_samples_within_inclusive_range():
+    config = _fast_config(
+        enable_olfaction=False,
+        randomize_layout=True,
+        spawn_xy_jitter=0.0,
+        spawn_yaw_jitter=0.0,
+        obstacle_positions=np.zeros((5, 2), dtype=float),
+        obstacle_count_range=(3, 5),
+        layout_min_target_spawn_distance=10.0,
+        layout_min_obstacle_spawn_distance=3.0,
+        layout_min_obstacle_target_distance=4.0,
+        layout_min_obstacle_obstacle_distance=4.0,
+    )
+    task = OdorObstacleNavigationTask(config)
+    try:
+        for seed in range(20, 26):
+            _, info = task.reset(seed=seed)
+
+            assert 3 <= info["active_obstacle_count"] <= 5
+            assert (
+                info["active_obstacle_positions"].shape[0]
+                == info["active_obstacle_count"]
+            )
+            _assert_layout_clearances(info, config)
+    finally:
+        task.close()
+
+
+def test_odor_intensity_helper_matches_obstacle_odor_world():
+    odor_source = np.array([[25.0, -2.0, 2.0]], dtype=float)
+    peak = np.array([[1.5]], dtype=float)
+    sensor_positions = np.array(
+        [
+            [0.0, 0.0, 0.8],
+            [1.0, 0.0, 0.8],
+            [0.0, 1.0, 0.8],
+            [1.0, 1.0, 0.8],
+        ],
+        dtype=float,
+    )
+    world = ObstacleOdorWorld(
+        odor_source=odor_source,
+        peak_odor_intensity=peak,
+        obstacle_positions=np.zeros((0, 2), dtype=float),
+    )
+
+    np.testing.assert_allclose(
+        _odor_intensity_from_sources(sensor_positions, odor_source, peak),
+        world.get_olfaction(sensor_positions),
+    )
 
 
 def test_short_real_rollout_runs():
@@ -321,6 +459,50 @@ def test_navigation_vec_env_auto_resets_done_envs(
         assert "terminal_observation" in infos[0]
         assert infos[0]["TimeLimit.truncated"]
         np.testing.assert_allclose(obs, 0.0)
+    finally:
+        env.close()
+
+
+def test_navigation_vec_env_sanitizes_nonfinite_reset_observations():
+    from flygym_demo.odor_obstacle_navigation.ppo import NavigationVecEnv
+
+    env = NavigationVecEnv(
+        NonfiniteResetNavigationTask,
+        num_envs=1,
+        env_runner="sync",
+    )
+    try:
+        obs = env.reset()
+
+        assert np.all(np.isfinite(obs))
+        np.testing.assert_allclose(obs, 0.0)
+        assert env.reset_infos[0]["nonfinite_reset_observation_count"] == 1
+    finally:
+        env.close()
+
+
+def test_navigation_vec_env_quarantines_nonfinite_step_outputs():
+    from flygym_demo.odor_obstacle_navigation.ppo import NavigationVecEnv
+
+    env = NavigationVecEnv(
+        NonfiniteStepNavigationTask,
+        num_envs=2,
+        env_runner="sync",
+    )
+    try:
+        env.reset()
+        obs, rewards, dones, infos = env.step(np.zeros((2, 2), dtype=np.float32))
+
+        assert np.all(np.isfinite(obs))
+        assert np.all(np.isfinite(rewards))
+        assert np.all(dones)
+        np.testing.assert_allclose(rewards, 0.0)
+        for info in infos:
+            assert info["failure_reason"] == "nonfinite_env_output"
+            assert info["nonfinite_env_output"]
+            assert info["nonfinite_observation_count"] == 1
+            assert info["nonfinite_reward"]
+            assert np.all(np.isfinite(info["terminal_observation"]))
     finally:
         env.close()
 
@@ -484,9 +666,45 @@ def test_ccd_tuner_recommends_lowest_stable_value():
     module = _load_ccd_tuner()
     row = module.TrialResult
     rows = [
-        row(100, 0, 4, 1.0, 10.0, 9.0, 1000.0, 0, 0.1, 5.0),
-        row(200, 0, 0, 1.0, 10.8, 9.8, 930.0, 0, 0.1, 5.0),
-        row(300, 0, 0, 1.0, 12.0, 11.0, 850.0, 0, 0.1, 5.0),
+        row(
+            ccd_iterations=100,
+            num_envs=64,
+            repeat=0,
+            ccd_warning_count=4,
+            construction_wall_seconds=1.0,
+            rollout_wall_seconds=10.0,
+            phase_env_step_wall_seconds=9.0,
+            simulator_substeps_per_second=1000.0,
+            nan_or_inf_count=0,
+            mean_min_obstacle_clearance=0.1,
+            mean_forward_distance=5.0,
+        ),
+        row(
+            ccd_iterations=200,
+            num_envs=64,
+            repeat=0,
+            ccd_warning_count=0,
+            construction_wall_seconds=1.0,
+            rollout_wall_seconds=10.8,
+            phase_env_step_wall_seconds=9.8,
+            simulator_substeps_per_second=930.0,
+            nan_or_inf_count=0,
+            mean_min_obstacle_clearance=0.1,
+            mean_forward_distance=5.0,
+        ),
+        row(
+            ccd_iterations=300,
+            num_envs=64,
+            repeat=0,
+            ccd_warning_count=0,
+            construction_wall_seconds=1.0,
+            rollout_wall_seconds=12.0,
+            phase_env_step_wall_seconds=11.0,
+            simulator_substeps_per_second=850.0,
+            nan_or_inf_count=0,
+            mean_min_obstacle_clearance=0.1,
+            mean_forward_distance=5.0,
+        ),
     ]
 
     assert (
@@ -563,6 +781,20 @@ class StubNavigationTask:
 class DieOnResetNavigationTask(StubNavigationTask):
     def reset(self, seed: int | None = None):
         os.kill(os.getpid(), signal.SIGKILL)
+
+
+class NonfiniteResetNavigationTask(StubNavigationTask):
+    def reset(self, seed: int | None = None):
+        obs, info = super().reset(seed=seed)
+        obs[3] = np.nan
+        return obs, info
+
+
+class NonfiniteStepNavigationTask(StubNavigationTask):
+    def step(self, action: np.ndarray):
+        obs, _, _, _, info = super().step(action)
+        obs[2] = np.nan
+        return obs, float("inf"), False, False, info
 
 
 class StubDiscreteNavigationTask:

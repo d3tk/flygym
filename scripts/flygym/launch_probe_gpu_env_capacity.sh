@@ -17,14 +17,22 @@ resolve_repo_root() {
 }
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(resolve_repo_root "${SCRIPT_DIR}/../..")" || {
+if ! REPO_ROOT="$(resolve_repo_root "${SCRIPT_DIR}/../..")"; then
+    for start_dir in "${SLURM_SUBMIT_DIR:-}" "${SCRIPT_DIR}"; do
+        if [[ -n "${start_dir}" ]] && REPO_ROOT="$(resolve_repo_root "${start_dir}")"; then
+            break
+        fi
+        REPO_ROOT=""
+    done
+fi
+if [[ -z "${REPO_ROOT:-}" ]]; then
     echo "Unable to locate flygym repo root." >&2
     exit 1
-}
+fi
 cd "${REPO_ROOT}"
 
 # shellcheck source=ensure_cuda_venv.sh
-source "${SCRIPT_DIR}/ensure_cuda_venv.sh"
+source "${REPO_ROOT}/scripts/flygym/ensure_cuda_venv.sh"
 ensure_cuda_venv "${REPO_ROOT}"
 verify_cuda_runtime "${REPO_ROOT}"
 

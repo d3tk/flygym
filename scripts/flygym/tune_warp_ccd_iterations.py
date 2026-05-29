@@ -31,6 +31,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 CCD_WARNING_RE = re.compile(r"ccd_iterations.*needs to be increased")
+OOM_RE = re.compile(r"(out of memory|Failed to allocate \d+ bytes)", re.IGNORECASE)
 DEFAULT_CCD_ITERATIONS = [200, 250, 300, 350, 400]
 FEATURE_MODES = {
     "full": (True, True),
@@ -43,6 +44,7 @@ FEATURE_MODES = {
 @dataclass(slots=True)
 class TrialResult:
     ccd_iterations: int
+    num_envs: int
     repeat: int
     ccd_warning_count: int
     construction_wall_seconds: float
@@ -83,6 +85,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=Path("outputs/odor_obstacle_navigation/benchmarks/ccd_iterations"),
     )
     parser.add_argument("--output-csv", type=Path, default=None)
+    parser.add_argument(
+        "--auto-reduce-envs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Retry OOM trials with fewer envs until they fit or min-num-envs is hit.",
+    )
+    parser.add_argument("--min-num-envs", type=int, default=1)
+    parser.add_argument("--env-reduction-factor", type=float, default=0.75)
     parser.add_argument("--max-warning-count", type=int, default=0)
     parser.add_argument("--max-slowdown-percent", type=float, default=10.0)
     parser.add_argument("--max-mean-obstacle-clearance", type=float, default=0.5)
@@ -159,25 +169,73 @@ def _run_parent(args: argparse.Namespace) -> None:
     rows: list[TrialResult] = []
     for ccd_iterations in args.ccd_iterations:
         for repeat in range(args.repeats):
-            log_path = args.output_dir / f"ccd_{ccd_iterations}_repeat_{repeat}.log"
-            metrics_path = args.output_dir / f"ccd_{ccd_iterations}_repeat_{repeat}.json"
-            if metrics_path.exists():
-                metrics_path.unlink()
-            with log_path.open("w", encoding="utf-8") as log_file:
-                completed = subprocess.run(
-                    _child_command(args, ccd_iterations, repeat, metrics_path),
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    check=False,
+            num_envs = args.num_envs
+            attempt = 0
+            while True:
+                log_path = _attempt_path(
+                    args.output_dir,
+                    ccd_iterations=ccd_iterations,
+                    num_envs=num_envs,
+                    repeat=repeat,
+                    attempt=attempt,
+                    suffix=".log",
                 )
-            warning_count = count_ccd_warnings(
-                log_path.read_text(encoding="utf-8", errors="replace")
-            )
-            row = _load_trial_result(metrics_path, ccd_iterations, repeat, warning_count)
-            row.ccd_warning_count = warning_count
-            rows.append(row)
-            _write_rows(output_csv, rows)
-            _print_trial(row, log_path, completed.returncode)
+                metrics_path = _attempt_path(
+                    args.output_dir,
+                    ccd_iterations=ccd_iterations,
+                    num_envs=num_envs,
+                    repeat=repeat,
+                    attempt=attempt,
+                    suffix=".json",
+                )
+                if metrics_path.exists():
+                    metrics_path.unlink()
+                with log_path.open("w", encoding="utf-8") as log_file:
+                    completed = subprocess.run(
+                        _child_command(
+                            args,
+                            ccd_iterations,
+                            repeat,
+                            metrics_path,
+                            num_envs,
+                        ),
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                        check=False,
+                    )
+                log_text = log_path.read_text(encoding="utf-8", errors="replace")
+                warning_count = count_ccd_warnings(log_text)
+                if (
+                    args.auto_reduce_envs
+                    and _is_oom_failure(log_text, completed.returncode)
+                    and num_envs > args.min_num_envs
+                ):
+                    next_num_envs = _reduced_num_envs(
+                        num_envs,
+                        factor=args.env_reduction_factor,
+                        min_num_envs=args.min_num_envs,
+                    )
+                    print(
+                        f"ccd={ccd_iterations:<4} repeat={repeat:<2} "
+                        f"num_envs={num_envs:<5} OOM; retrying num_envs={next_num_envs} "
+                        f"log={log_path}",
+                        flush=True,
+                    )
+                    num_envs = next_num_envs
+                    attempt += 1
+                    continue
+                row = _load_trial_result(
+                    metrics_path,
+                    ccd_iterations,
+                    num_envs,
+                    repeat,
+                    warning_count,
+                )
+                row.ccd_warning_count = warning_count
+                rows.append(row)
+                _write_rows(output_csv, rows)
+                _print_trial(row, log_path, completed.returncode)
+                break
 
     recommendation = choose_recommended_ccd(
         rows,
@@ -271,6 +329,7 @@ def run_stress_rollout(
     simulator_substeps = args.num_envs * args.rollout_steps * args.decision_steps
     return TrialResult(
         ccd_iterations=ccd_iterations,
+        num_envs=args.num_envs,
         repeat=repeat,
         ccd_warning_count=0,
         construction_wall_seconds=construction_wall_seconds,
@@ -290,6 +349,7 @@ def _child_command(
     ccd_iterations: int,
     repeat: int,
     metrics_path: Path,
+    num_envs: int,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -302,7 +362,7 @@ def _child_command(
         "--ccd-iterations",
         str(ccd_iterations),
         "--num-envs",
-        str(args.num_envs),
+        str(num_envs),
         "--feature-mode",
         args.feature_mode,
         "--rollout-steps",
@@ -325,14 +385,18 @@ def _child_command(
 def _load_trial_result(
     metrics_path: Path,
     ccd_iterations: int,
+    num_envs: int,
     repeat: int,
     warning_count: int,
 ) -> TrialResult:
     if metrics_path.exists():
         with metrics_path.open(encoding="utf-8") as f:
-            return TrialResult(**json.load(f))
+            data = json.load(f)
+        data.setdefault("num_envs", num_envs)
+        return TrialResult(**data)
     return TrialResult(
         ccd_iterations=ccd_iterations,
+        num_envs=num_envs,
         repeat=repeat,
         ccd_warning_count=warning_count,
         construction_wall_seconds=math.nan,
@@ -358,6 +422,7 @@ def _write_rows(path: Path, rows: list[TrialResult]) -> None:
 def _print_trial(row: TrialResult, log_path: Path, returncode: int) -> None:
     print(
         f"ccd={row.ccd_iterations:<4} repeat={row.repeat:<2} "
+        f"num_envs={row.num_envs:<5} "
         f"warnings={row.ccd_warning_count:<3} "
         f"nan_inf={row.nan_or_inf_count:<3} "
         f"substeps/s={row.simulator_substeps_per_second:>10.0f} "
@@ -373,6 +438,38 @@ def _group_rows(rows: list[TrialResult]) -> dict[int, list[TrialResult]]:
     for row in rows:
         grouped.setdefault(row.ccd_iterations, []).append(row)
     return grouped
+
+
+def _attempt_path(
+    output_dir: Path,
+    *,
+    ccd_iterations: int,
+    num_envs: int,
+    repeat: int,
+    attempt: int,
+    suffix: str,
+) -> Path:
+    if attempt == 0:
+        return output_dir / f"ccd_{ccd_iterations}_repeat_{repeat}{suffix}"
+    return output_dir / (
+        f"ccd_{ccd_iterations}_envs_{num_envs}_repeat_{repeat}_attempt_{attempt}{suffix}"
+    )
+
+
+def _is_oom_failure(log_text: str, returncode: int) -> bool:
+    return returncode != 0 and OOM_RE.search(log_text) is not None
+
+
+def _reduced_num_envs(
+    num_envs: int,
+    *,
+    factor: float,
+    min_num_envs: int,
+) -> int:
+    reduced = max(min_num_envs, int(math.floor(num_envs * factor)))
+    if reduced >= num_envs:
+        reduced = num_envs - 1
+    return max(min_num_envs, reduced)
 
 
 def _finite_mean(values) -> float:
@@ -407,6 +504,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("repeats must be positive.")
     if args.num_envs <= 0:
         raise ValueError("num-envs must be positive.")
+    if args.min_num_envs <= 0:
+        raise ValueError("min-num-envs must be positive.")
+    if args.min_num_envs > args.num_envs:
+        raise ValueError("min-num-envs cannot exceed num-envs.")
+    if not 0.0 < args.env_reduction_factor < 1.0:
+        raise ValueError("env-reduction-factor must be between 0 and 1.")
     if args.rollout_steps <= 0:
         raise ValueError("rollout-steps must be positive.")
     if args.decision_steps <= 0:

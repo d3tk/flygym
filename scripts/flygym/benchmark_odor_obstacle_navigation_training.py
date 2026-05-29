@@ -36,6 +36,7 @@ from flygym_demo.odor_obstacle_navigation import (  # noqa: E402
     NavigationTaskFactory,
     PPOConfig,
     make_navigation_vec_env,
+    resolve_minibatch_size,
 )
 from flygym_demo.odor_obstacle_navigation.runners import SubprocWorkerError  # noqa: E402
 
@@ -206,7 +207,8 @@ def main() -> None:
     ppo_devices = _requested_ppo_devices(args)
     env_devices = _requested_env_devices(args)
     feature_modes = _requested_feature_modes(args)
-    _validate_ppo_devices(ppo_devices)
+    if "ppo" in args.benchmark_layers:
+        _validate_ppo_devices(ppo_devices)
     _validate_env_devices(env_devices)
     if "raw" in args.benchmark_layers:
         _validate_env_devices(["cuda"])
@@ -361,12 +363,17 @@ def _run_trial(
         render=False,
     )
     total_timesteps = args.rollouts * args.rollout_steps * num_envs
+    minibatch_size = resolve_minibatch_size(
+        args.minibatch_size,
+        rollout_steps=args.rollout_steps,
+        num_envs=num_envs,
+    )
     ppo_config = PPOConfig(
         total_timesteps=total_timesteps,
         num_envs=num_envs,
         rollout_steps=args.rollout_steps,
         update_epochs=args.update_epochs,
-        minibatch_size=args.minibatch_size,
+        minibatch_size=minibatch_size,
         hidden_sizes=tuple(args.hidden_sizes),
         seed=seed,
         device=ppo_device,

@@ -17,6 +17,12 @@
 
 set -euo pipefail
 
+# sbatch forwards script args in "$@"; ignore an optional leading "--" separator.
+extra_benchmark_args=("$@")
+if [[ ${#extra_benchmark_args[@]} -gt 0 && "${extra_benchmark_args[0]}" == "--" ]]; then
+    extra_benchmark_args=("${extra_benchmark_args[@]:1}")
+fi
+
 resolve_repo_root() {
     local dir="$1"
     while [[ "${dir}" != "/" ]]; do
@@ -81,7 +87,7 @@ fi
 cd "${REPO_ROOT}"
 
 # shellcheck source=ensure_cuda_venv.sh
-source "${SCRIPT_DIR}/ensure_cuda_venv.sh"
+source "${REPO_ROOT}/scripts/flygym/ensure_cuda_venv.sh"
 ensure_cuda_venv "${REPO_ROOT}"
 verify_cuda_runtime "${REPO_ROOT}"
 
@@ -138,7 +144,7 @@ TIMESTEP="${TIMESTEP:-0.0001}"
 DECISION_STEPS="${DECISION_STEPS:-500}"
 EPISODE_TIME_SECONDS="${EPISODE_TIME_SECONDS:-5}"
 ROLLOUT_STEPS="${ROLLOUT_STEPS:-200}"
-BATCH_SIZE="${BATCH_SIZE:-1200}"
+BATCH_SIZE="${BATCH_SIZE:-842}"
 UPDATE_EPOCHS="${UPDATE_EPOCHS:-10}"
 ROLLOUTS="${ROLLOUTS:-1}"
 REPEATS="${REPEATS:-1}"
@@ -193,17 +199,17 @@ uv run --extra warp python scripts/flygym/benchmark_odor_obstacle_navigation_tra
     --num-envs "${CPU_NUM_ENVS_ARGS[@]}" \
     --output-csv "${CPU_OUTPUT_CSV}" \
     "${common_benchmark_args[@]}" \
-    "$@"
+    "${extra_benchmark_args[@]+"${extra_benchmark_args[@]}"}"
 
 echo "=== Phase 2b: GPU warp env sweep (${GPU_NUM_ENVS}) ===" >&2
 uv run --extra warp python scripts/flygym/benchmark_odor_obstacle_navigation_training.py \
     --runners warp \
-    --ppo-devices cpu cuda \
+    --ppo-devices cpu \
     --env-devices cuda \
     --num-envs "${GPU_NUM_ENVS_ARGS[@]}" \
     --output-csv "${GPU_OUTPUT_CSV}" \
     "${common_benchmark_args[@]}" \
-    "$@"
+    "${extra_benchmark_args[@]+"${extra_benchmark_args[@]}"}"
 
 echo "Done. Probe: ${PROBE_OUTPUT_JSON}" >&2
 echo "CPU sweep CSV: ${CPU_OUTPUT_CSV}" >&2

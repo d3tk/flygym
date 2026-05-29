@@ -365,6 +365,9 @@ def make_task_runner(
 
 
 def _task_worker(conn, task_factory: Callable[[], Any], rank: int) -> None:
+    from flygym.utils.stderr_filter import install_ccd_iterations_warning_filter
+
+    install_ccd_iterations_warning_filter()
     task = None
     try:
         task = task_factory()

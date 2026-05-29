@@ -1,11 +1,18 @@
 """Unit tests for flygym.utils (math, exceptions, mjcf, profiling, video, pose_conversion)."""
 
 import pathlib
+import sys
+from pathlib import Path
+
 import pytest
 import numpy as np
 
 from flygym.utils.math import Tree, orderedset, Rotation3D
 from flygym.utils.exceptions import FlyGymInternalError
+from flygym.utils.stderr_filter import (
+    CCD_ITERATIONS_WARNING_RE,
+    should_filter_stderr_line,
+)
 
 
 # ==============================================================================
@@ -538,3 +545,63 @@ class TestQposToKinematicPose:
         right_keys = [k for k in keys if "r_" in k or k.startswith("r")]
         # Right-side joints should be present (mirroring was applied)
         assert len(right_keys) > 0
+
+
+# ==============================================================================
+# stderr_filter
+# ==============================================================================
+
+
+class TestStderrFilter:
+    def test_ccd_warning_pattern_matches_mjwarp_message(self):
+        message = (
+            "Warning: opt.ccd_iterations, currently set to 300, "
+            "needs to be increased.\n"
+        )
+        assert CCD_ITERATIONS_WARNING_RE.search(message) is not None
+        assert should_filter_stderr_line(message)
+
+    def test_ccd_warning_pattern_ignores_unrelated_stderr(self):
+        assert not should_filter_stderr_line("Warning: unrelated\n")
+        assert not should_filter_stderr_line("nefc overflow - please increase njmax\n")
+
+    def test_install_filters_fd_stderr(self, tmp_path):
+        import subprocess
+        import textwrap
+
+        script = tmp_path / "stderr_filter_probe.py"
+        script.write_text(
+            textwrap.dedent(
+                """
+                import os
+                import sys
+
+                sys.path.insert(0, {src_dir!r})
+                from flygym.utils.stderr_filter import install_ccd_iterations_warning_filter
+
+                read_fd, write_fd = os.pipe()
+                saved_stderr = os.dup(2)
+                os.dup2(write_fd, 2)
+                os.close(write_fd)
+
+                install_ccd_iterations_warning_filter()
+                os.write(
+                    2,
+                    b"Warning: opt.ccd_iterations, currently set to 300, "
+                    b"needs to be increased.\\n",
+                )
+                os.write(2, b"keep-me\\n")
+                os.dup2(saved_stderr, 2)
+                os.close(saved_stderr)
+                sys.stdout.write(os.read(read_fd, 4096).decode("utf-8"))
+                """
+            ).format(src_dir=str(Path(__file__).resolve().parents[2] / "src"))
+        )
+        completed = subprocess.run(
+            [sys.executable, str(script)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert "ccd_iterations" not in completed.stdout
+        assert completed.stdout.count("keep-me") == 1

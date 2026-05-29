@@ -1,6 +1,10 @@
 import warnings
 from typing import Any, Literal, override
 
+from flygym.utils.stderr_filter import install_ccd_iterations_warning_filter
+
+install_ccd_iterations_warning_filter()
+
 import warp as wp
 import mujoco as mj
 import mujoco_warp as mjw

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Find the max parallel Warp env count for this GPU.
 
-Default mode: start from a known-good ``--search-start`` (64), step upward until OOM,
-then binary-search the boundary. Optional ``--calibration-envs`` fits MiB/env from a
-low sweep (slow; only needed if you want a VRAM model without probing high counts).
+Default mode: verify ``--search-start``, estimate a high ``num_envs`` from VRAM (or
+optional ``--calibration-envs`` fit), probe that count first, then binary-search the
+OOM boundary. If the initial high count succeeds, env count doubles until OOM.
 
 Each probe runs in a fresh subprocess so CUDA OOM does not poison later trials.
 Memory is read from ``nvidia-smi`` (Warp + PyTorch on the device).
@@ -44,6 +44,9 @@ FEATURE_MODES = {
     "no-sensors": (False, False),
 }
 
+# Hard stop for exponential search (not a normal cap on usable env count).
+_SANITY_MAX_ENVS = 8192
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -65,13 +68,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--search-start",
         type=int,
         default=64,
-        help="Known-good num_envs; sweep tries values above this until OOM.",
+        help="Known-good floor for num_envs; must succeed before the OOM sweep.",
     )
     parser.add_argument(
         "--search-step",
         type=int,
         default=16,
-        help="Add this many envs per upward probe until failure.",
+        help="Step size when bracketing upward after the initial high probe succeeds.",
     )
     parser.add_argument(
         "--reservation-fraction",
@@ -112,8 +115,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-search-ceiling",
         type=int,
-        default=512,
-        help="Upper bound for binary search on num_envs.",
+        default=None,
+        help=(
+            "Optional cap on num_envs during the sweep. By default the first probe "
+            "uses VRAM (or calibration fit) and search continues until OOM."
+        ),
     )
     parser.add_argument(
         "--output-json",
@@ -146,6 +152,8 @@ def _run_parent(args: argparse.Namespace) -> None:
         raise ValueError("search-start must be positive.")
     if args.search_step <= 0:
         raise ValueError("search-step must be positive.")
+    if args.max_search_ceiling is not None and args.max_search_ceiling <= args.search_start:
+        raise ValueError("max-search-ceiling must be greater than search-start.")
 
     gpu_name, _memory_used_mib, memory_total_mib = query_gpu_memory_mib()
     calibration_envs = sorted(
@@ -159,9 +167,14 @@ def _run_parent(args: argparse.Namespace) -> None:
     if calibration_envs:
         print(f"Calibration num_envs: {calibration_envs}", flush=True)
     else:
+        ceiling_note = (
+            f", optional_ceiling={args.max_search_ceiling}"
+            if args.max_search_ceiling is not None
+            else ""
+        )
         print(
-            f"OOM sweep: start={args.search_start}, step={args.search_step}, "
-            f"ceiling={args.max_search_ceiling}",
+            f"OOM sweep: floor={args.search_start}, step={args.search_step}"
+            f"{ceiling_note}",
             flush=True,
         )
 
@@ -181,10 +194,12 @@ def _run_parent(args: argparse.Namespace) -> None:
     oom_sweep_rows: list[dict[str, Any]] = []
     max_verified = last_good
     max_probe_row: dict[str, Any] | None = None
+    initial_high = 0
     if not args.skip_oom_sweep:
-        max_verified, max_probe_row, oom_sweep_rows = _oom_sweep_max(
+        max_verified, max_probe_row, oom_sweep_rows, initial_high = _oom_sweep_max(
             args,
             memory_total_mib=memory_total_mib,
+            estimated_max=estimated_max,
         )
 
     report = {
@@ -194,6 +209,8 @@ def _run_parent(args: argparse.Namespace) -> None:
         "target_mib": target_mib,
         "search_start": args.search_start,
         "search_step": args.search_step,
+        "initial_high_num_envs": initial_high,
+        "max_search_ceiling": args.max_search_ceiling,
         "feature_mode": args.feature_mode,
         "include_ppo": args.include_ppo,
         "ccd_iterations": args.ccd_iterations,
@@ -249,12 +266,43 @@ def _print_probe_row(
         print(f"  n={num_envs:4d}: FAIL ({row.get('error', 'unknown')})", flush=True)
 
 
+def _effective_search_cap(
+    args: argparse.Namespace,
+    *,
+    memory_total_mib: int,
+) -> int:
+    cap = min(_SANITY_MAX_ENVS, memory_total_mib)
+    if args.max_search_ceiling is not None:
+        cap = min(cap, args.max_search_ceiling)
+    return cap
+
+
+def _derive_initial_high(
+    *,
+    args: argparse.Namespace,
+    memory_total_mib: int,
+    start_row: dict[str, Any],
+    estimated_max: int,
+) -> int:
+    if estimated_max > args.search_start:
+        return estimated_max
+    mem = int(start_row["memory_after_warmup_mib"])
+    baseline = int(start_row.get("memory_baseline_mib", 0))
+    used_mib = max(mem - baseline, 1)
+    per_env_mib = used_mib / args.search_start
+    target_mib = int(memory_total_mib * args.reservation_fraction)
+    return max(args.search_start + args.search_step, int(target_mib / per_env_mib))
+
+
 def _oom_sweep_max(
     args: argparse.Namespace,
     *,
     memory_total_mib: int,
-) -> tuple[int, dict[str, Any] | None, list[dict[str, Any]]]:
+    estimated_max: int,
+) -> tuple[int, dict[str, Any] | None, list[dict[str, Any]], int]:
     rows: list[dict[str, Any]] = []
+    search_cap = _effective_search_cap(args, memory_total_mib=memory_total_mib)
+
     start_row = _run_probe_subprocess(args, args.search_start)
     rows.append(start_row)
     _print_probe_row(args.search_start, start_row, memory_total_mib)
@@ -265,19 +313,52 @@ def _oom_sweep_max(
 
     last_good = args.search_start
     best_row = start_row
+    initial_high = min(
+        _derive_initial_high(
+            args=args,
+            memory_total_mib=memory_total_mib,
+            start_row=start_row,
+            estimated_max=estimated_max,
+        ),
+        search_cap,
+    )
+    print(
+        f"Initial high probe: n={initial_high} "
+        f"(VRAM target {int(memory_total_mib * args.reservation_fraction)} MiB, "
+        f"search cap {search_cap})",
+        flush=True,
+    )
+
+    high_row = _run_probe_subprocess(args, initial_high)
+    rows.append(high_row)
+    _print_probe_row(initial_high, high_row, memory_total_mib)
+
     first_fail: int | None = None
-    candidate = args.search_start + args.search_step
-    while candidate <= args.max_search_ceiling:
-        row = _run_probe_subprocess(args, candidate)
-        rows.append(row)
-        _print_probe_row(candidate, row, memory_total_mib)
-        if row["succeeded"]:
-            last_good = candidate
-            best_row = row
-            candidate += args.search_step
-            continue
-        first_fail = candidate
-        break
+    if high_row["succeeded"]:
+        last_good = initial_high
+        best_row = high_row
+        candidate = min(last_good * 2, search_cap)
+        while candidate > last_good:
+            if candidate == last_good:
+                break
+            row = _run_probe_subprocess(args, candidate)
+            rows.append(row)
+            _print_probe_row(candidate, row, memory_total_mib)
+            if row["succeeded"]:
+                last_good = candidate
+                best_row = row
+                if candidate >= search_cap:
+                    print(
+                        f"Reached search cap {search_cap} without OOM.",
+                        flush=True,
+                    )
+                    break
+                candidate = min(last_good * 2, search_cap)
+                continue
+            first_fail = candidate
+            break
+    else:
+        first_fail = initial_high
 
     if first_fail is not None and first_fail > last_good + 1:
         print(
@@ -289,14 +370,9 @@ def _oom_sweep_max(
             low=last_good,
             high=first_fail,
         )
-    elif first_fail is None and candidate > args.max_search_ceiling:
-        print(
-            f"Reached --max-search-ceiling {args.max_search_ceiling} without OOM.",
-            flush=True,
-        )
 
     print(f"Max verified num_envs: {last_good}", flush=True)
-    return last_good, best_row, rows
+    return last_good, best_row, rows, initial_high
 
 
 def _run_child(args: argparse.Namespace) -> None:

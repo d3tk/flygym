@@ -38,6 +38,7 @@ dependencies = [
     "wandb[examples]>=0.27.0",
     "gymnasium>=1.2,<1.4",
     "stable-baselines3>=2.8,<2.9",
+    "tensorboard>=2.20.0",
 ]
 
 [project.optional-dependencies]

@@ -1,13 +1,87 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
 from gymnasium import spaces
-from stable_baselines3.common.vec_env import VecEnv
+from stable_baselines3.common.vec_env import VecEnv, VecMonitor, VecNormalize
 
 from flygym_demo.odor_obstacle_navigation.runners import make_task_runner
+
+
+def _finite_float32_array(values: Any) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float32).copy()
+    if not np.all(np.isfinite(array)):
+        np.nan_to_num(
+            array,
+            copy=False,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+    return array
+
+
+def _nonfinite_counts_by_env(values: Any, num_envs: int) -> np.ndarray:
+    array = np.asarray(values)
+    if array.shape[0] != num_envs:
+        raise ValueError(
+            f"Expected first dimension {num_envs}, got shape {array.shape}."
+        )
+    flattened = array.reshape(num_envs, -1)
+    return np.count_nonzero(~np.isfinite(flattened), axis=1).astype(np.int32)
+
+
+def _mark_nonfinite_reset_infos(
+    infos: list[dict[str, Any]],
+    obs_nonfinite_counts: np.ndarray,
+) -> None:
+    for env_idx, count in enumerate(obs_nonfinite_counts):
+        if count <= 0:
+            continue
+        infos[env_idx]["nonfinite_reset_observation_count"] = int(count)
+
+
+def _mark_nonfinite_step_infos(
+    infos: list[dict[str, Any]],
+    env_indices: np.ndarray,
+    obs_nonfinite_counts: np.ndarray,
+    reward_nonfinite: np.ndarray,
+) -> None:
+    for env_idx in env_indices:
+        info = infos[int(env_idx)]
+        previous_reason = info.get("failure_reason")
+        if previous_reason is not None and previous_reason != "nonfinite_env_output":
+            info["previous_failure_reason"] = previous_reason
+        info["failure_reason"] = "nonfinite_env_output"
+        info["nonfinite_env_output"] = True
+        info["nonfinite_observation_count"] = int(obs_nonfinite_counts[int(env_idx)])
+        info["nonfinite_reward"] = bool(reward_nonfinite[int(env_idx)])
+
+
+def resolve_minibatch_size(
+    minibatch_size: int,
+    *,
+    rollout_steps: int,
+    num_envs: int,
+) -> int:
+    """Pick a minibatch size that evenly divides ``rollout_steps * num_envs``."""
+    if minibatch_size <= 0:
+        raise ValueError("minibatch_size must be positive.")
+    if rollout_steps <= 0 or num_envs <= 0:
+        raise ValueError("rollout_steps and num_envs must be positive.")
+    buffer_size = rollout_steps * num_envs
+    if buffer_size % minibatch_size == 0:
+        return minibatch_size
+    for candidate in range(minibatch_size, 0, -1):
+        if buffer_size % candidate == 0:
+            return candidate
+    raise ValueError(
+        f"No minibatch_size <= {minibatch_size} divides rollout buffer "
+        f"{buffer_size} ({rollout_steps} x {num_envs})."
+    )
 
 
 @dataclass(slots=True)
@@ -95,6 +169,10 @@ class NavigationVecEnv(VecEnv):
     def reset(self) -> np.ndarray:
         seeds = list(self._seeds)
         obs, infos = self.runner.reset_at(range(self.num_envs), seeds)
+        infos = [dict(info) for info in infos]
+        obs_nonfinite_counts = _nonfinite_counts_by_env(obs, self.num_envs)
+        obs = _finite_float32_array(obs)
+        _mark_nonfinite_reset_infos(infos, obs_nonfinite_counts)
         self.reset_infos = infos
         self._reset_seeds()
         self._reset_options()
@@ -108,8 +186,26 @@ class NavigationVecEnv(VecEnv):
             raise RuntimeError("step_async must be called before step_wait.")
         obs, rewards, terminated, truncated, infos = self.runner.step(self._actions)
         self._actions = None
-        dones = np.logical_or(terminated, truncated)
         infos = [dict(info) for info in infos]
+        obs_nonfinite_counts = _nonfinite_counts_by_env(obs, self.num_envs)
+        reward_nonfinite = ~np.isfinite(np.asarray(rewards, dtype=np.float32))
+        nonfinite_indices = np.flatnonzero(
+            (obs_nonfinite_counts > 0) | reward_nonfinite
+        )
+        obs = _finite_float32_array(obs)
+        rewards = _finite_float32_array(rewards)
+        terminated = np.asarray(terminated, dtype=bool).copy()
+        truncated = np.asarray(truncated, dtype=bool).copy()
+        if nonfinite_indices.size:
+            _mark_nonfinite_step_infos(
+                infos,
+                nonfinite_indices,
+                obs_nonfinite_counts,
+                reward_nonfinite,
+            )
+            terminated[nonfinite_indices] = True
+            truncated[nonfinite_indices] = False
+        dones = np.logical_or(terminated, truncated)
         done_indices = np.flatnonzero(dones)
         for env_idx in done_indices:
             infos[env_idx]["terminal_observation"] = obs[env_idx].copy()
@@ -118,6 +214,13 @@ class NavigationVecEnv(VecEnv):
             )
         if done_indices.size:
             reset_obs, reset_infos = self.runner.reset_at(done_indices)
+            reset_infos = [dict(info) for info in reset_infos]
+            reset_obs_nonfinite_counts = _nonfinite_counts_by_env(
+                reset_obs,
+                len(done_indices),
+            )
+            reset_obs = _finite_float32_array(reset_obs)
+            _mark_nonfinite_reset_infos(reset_infos, reset_obs_nonfinite_counts)
             for row, env_idx in enumerate(done_indices):
                 obs[env_idx] = reset_obs[row]
                 self.reset_infos[env_idx] = reset_infos[row]
@@ -181,12 +284,61 @@ def make_navigation_vec_env(
     )
 
 
+def build_training_vec_env(
+    task_factory: Callable[[], Any],
+    config: PPOConfig,
+    *,
+    vecnormalize_path: Path | str | None = None,
+) -> VecNormalize:
+    env = make_navigation_vec_env(task_factory, config)
+    env = VecMonitor(env)
+    if vecnormalize_path is not None:
+        env = VecNormalize.load(str(vecnormalize_path), env)
+        env.training = True
+        env.norm_reward = False
+    else:
+        env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0)
+    return env
+
+
+def build_eval_vec_env(
+    task_factory: Callable[[], Any],
+    config: PPOConfig,
+    *,
+    num_envs: int,
+) -> VecNormalize:
+    eval_config = PPOConfig(
+        total_timesteps=config.total_timesteps,
+        num_envs=num_envs,
+        rollout_steps=config.rollout_steps,
+        update_epochs=config.update_epochs,
+        minibatch_size=config.minibatch_size,
+        gamma=config.gamma,
+        gae_lambda=config.gae_lambda,
+        learning_rate=config.learning_rate,
+        clip_coef=config.clip_coef,
+        entropy_coef=config.entropy_coef,
+        value_coef=config.value_coef,
+        max_grad_norm=config.max_grad_norm,
+        hidden_sizes=config.hidden_sizes,
+        seed=config.seed,
+        device=config.device,
+        env_device=config.env_device,
+        env_runner=config.env_runner,
+        mp_start_method=config.mp_start_method,
+    )
+    env = make_navigation_vec_env(task_factory, eval_config)
+    env = VecMonitor(env)
+    env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0, training=False)
+    return env
+
+
 def evaluation_metrics(results: list[dict[str, float]]) -> dict[str, float]:
     returns = np.asarray([result["return"] for result in results], dtype=np.float32)
     lengths = np.asarray([result["steps"] for result in results], dtype=np.float32)
     successes = np.asarray([result["success"] for result in results], dtype=np.float32)
     return {
-        "eval/success_rate": float(100.0 * successes.mean()),
+        "eval/success_rate": float(successes.mean()),
         "eval/mean_reward": float(returns.mean()),
         "eval/mean_ep_length": float(lengths.mean()),
     }

@@ -38,7 +38,7 @@ fi
 cd "${REPO_ROOT}"
 
 # shellcheck source=ensure_cuda_venv.sh
-source "${SCRIPT_DIR}/ensure_cuda_venv.sh"
+source "${REPO_ROOT}/scripts/flygym/ensure_cuda_venv.sh"
 ensure_cuda_venv "${REPO_ROOT}"
 verify_cuda_runtime "${REPO_ROOT}"
 

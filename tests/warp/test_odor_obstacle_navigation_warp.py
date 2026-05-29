@@ -11,7 +11,11 @@ pytestmark = pytest.mark.skipif(
     reason="Warp CUDA device is not available.",
 )
 
-from flygym_demo.odor_obstacle_navigation.task import NavigationTaskConfig  # noqa: E402
+from flygym_demo.odor_obstacle_navigation.task import (  # noqa: E402
+    NavigationTaskConfig,
+    _odor_by_side,
+    _odor_intensity_from_sources,
+)
 from flygym_demo.odor_obstacle_navigation.warp_runner import (  # noqa: E402
     WarpNavigationTaskRunner,
 )
@@ -29,6 +33,24 @@ def _fast_config(**kwargs) -> NavigationTaskConfig:
     }
     defaults.update(kwargs)
     return NavigationTaskConfig(**defaults)
+
+
+def _random_layout_config(**kwargs) -> NavigationTaskConfig:
+    defaults = {
+        "enable_vision": False,
+        "enable_olfaction": False,
+        "randomize_layout": True,
+        "spawn_xy_jitter": 0.0,
+        "spawn_yaw_jitter": 0.0,
+        "obstacle_positions": np.zeros((5, 2), dtype=float),
+        "obstacle_count_range": (3, 5),
+        "layout_min_target_spawn_distance": 10.0,
+        "layout_min_obstacle_spawn_distance": 3.0,
+        "layout_min_obstacle_target_distance": 4.0,
+        "layout_min_obstacle_obstacle_distance": 4.0,
+    }
+    defaults.update(kwargs)
+    return _fast_config(**defaults)
 
 
 def _assert_vision_feature_ranges(features: dict) -> None:
@@ -94,5 +116,124 @@ def test_warp_runner_no_vision_keeps_vision_fields_zero():
             )
             assert features["object_size"] == 0.0
             assert features["collision_risk"] == 0.0
+    finally:
+        runner.close()
+
+
+def test_warp_runner_randomized_layout_resets_are_seeded():
+    runner = WarpNavigationTaskRunner(_random_layout_config(), num_envs=2)
+    try:
+        _, infos_a = runner.reset(seed=789)
+        _, infos_b = runner.reset(seed=789)
+
+        for info_a, info_b in zip(infos_a, infos_b, strict=True):
+            np.testing.assert_allclose(
+                info_a["target_position"],
+                info_b["target_position"],
+            )
+            np.testing.assert_allclose(
+                info_a["obstacle_positions"],
+                info_b["obstacle_positions"],
+            )
+            assert info_a["active_obstacle_count"] == info_b["active_obstacle_count"]
+            np.testing.assert_allclose(
+                info_a["active_obstacle_positions"],
+                info_b["active_obstacle_positions"],
+            )
+    finally:
+        runner.close()
+
+
+def test_warp_runner_reset_at_only_changes_selected_layout_rows():
+    runner = WarpNavigationTaskRunner(_random_layout_config(), num_envs=3)
+    try:
+        runner.reset(seed=100)
+        odor_before = runner.current_odor_source.copy()
+        obstacles_before = runner.current_obstacle_positions.copy()
+        active_before = runner.current_active_obstacle_counts.copy()
+
+        runner.reset_at([1], seeds=[999])
+
+        np.testing.assert_allclose(runner.current_odor_source[0], odor_before[0])
+        np.testing.assert_allclose(runner.current_odor_source[2], odor_before[2])
+        np.testing.assert_allclose(
+            runner.current_obstacle_positions[0],
+            obstacles_before[0],
+        )
+        np.testing.assert_allclose(
+            runner.current_obstacle_positions[2],
+            obstacles_before[2],
+        )
+        assert runner.current_active_obstacle_counts[0] == active_before[0]
+        assert runner.current_active_obstacle_counts[2] == active_before[2]
+        assert not np.allclose(runner.current_odor_source[1], odor_before[1])
+    finally:
+        runner.close()
+
+
+def test_warp_runner_mocap_positions_match_per_env_layouts():
+    runner = WarpNavigationTaskRunner(_random_layout_config(), num_envs=2)
+    try:
+        runner.reset(seed=200)
+        mocap_pos = runner.sim.mjw_data.mocap_pos.numpy()
+        obstacle_z = runner.config.obstacle_height / 2
+
+        for env_idx in range(runner.num_envs):
+            for source_idx, mocap_id in enumerate(runner._odor_mocap_ids):
+                np.testing.assert_allclose(
+                    mocap_pos[env_idx, mocap_id],
+                    runner.current_odor_source[env_idx, source_idx],
+                    atol=1e-5,
+                )
+            for obstacle_idx, mocap_id in enumerate(runner._obstacle_mocap_ids):
+                expected = np.array(
+                    [
+                        runner.current_obstacle_positions[env_idx, obstacle_idx, 0],
+                        runner.current_obstacle_positions[env_idx, obstacle_idx, 1],
+                        obstacle_z,
+                    ],
+                    dtype=np.float32,
+                )
+                np.testing.assert_allclose(
+                    mocap_pos[env_idx, mocap_id],
+                    expected,
+                    atol=1e-5,
+                )
+    finally:
+        runner.close()
+
+
+def test_warp_runner_odor_observations_use_each_env_target():
+    runner = WarpNavigationTaskRunner(
+        _random_layout_config(enable_olfaction=True),
+        num_envs=2,
+    )
+    try:
+        obs, infos = runner.reset(seed=300)
+        site_positions = runner.sim.mjw_data.site_xpos.numpy()
+
+        for env_idx, info in enumerate(infos):
+            sensor_positions = site_positions[
+                env_idx,
+                runner._olfaction_site_ids,
+                :,
+            ]
+            expected = _odor_by_side(
+                _odor_intensity_from_sources(
+                    sensor_positions,
+                    runner.current_odor_source[env_idx],
+                    runner.config.peak_odor_intensity,
+                ),
+                runner.config.odor_palps_antennae_weights,
+            )
+            np.testing.assert_allclose(obs[env_idx, :2], expected, rtol=1e-5)
+            np.testing.assert_allclose(
+                [
+                    info["processed_features"]["odor_left"],
+                    info["processed_features"]["odor_right"],
+                ],
+                expected,
+                rtol=1e-5,
+            )
     finally:
         runner.close()

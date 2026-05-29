@@ -77,6 +77,15 @@ class NavigationTaskConfig:
     odor_source_y_range: tuple[float, float] = (-6.0, 6.0)
     obstacle_x_range: tuple[float, float] = (6.0, 20.0)
     obstacle_y_range: tuple[float, float] = (-8.0, 8.0)
+    obstacle_count_range: tuple[int, int] | None = None
+    inactive_obstacle_position: np.ndarray = field(
+        default_factory=lambda: np.array([1000.0, 0.0], dtype=float)
+    )
+    layout_min_target_spawn_distance: float = 0.0
+    layout_min_obstacle_spawn_distance: float = 0.0
+    layout_min_obstacle_target_distance: float = 0.0
+    layout_min_obstacle_obstacle_distance: float = 0.0
+    layout_sampling_attempts: int = 1000
     enable_vision: bool = True
     enable_olfaction: bool = True
     render: bool = False
@@ -91,6 +100,9 @@ class NavigationTaskConfig:
         self.peak_odor_intensity = np.asarray(self.peak_odor_intensity, dtype=float)
         self.obstacle_positions = np.asarray(self.obstacle_positions, dtype=float)
         self.obstacle_colors = np.asarray(self.obstacle_colors, dtype=float)
+        self.inactive_obstacle_position = np.asarray(
+            self.inactive_obstacle_position, dtype=float
+        )
         if self.timestep <= 0:
             raise ValueError("timestep must be positive.")
         if self.ccd_iterations <= 0:
@@ -119,6 +131,29 @@ class NavigationTaskConfig:
             raise ValueError("peak_odor_intensity must have shape (1, odor_dims).")
         if self.obstacle_positions.ndim != 2 or self.obstacle_positions.shape[1] != 2:
             raise ValueError("obstacle_positions must have shape (n_obstacles, 2).")
+        if self.inactive_obstacle_position.shape != (2,):
+            raise ValueError("inactive_obstacle_position must have shape (2,).")
+        if self.obstacle_count_range is not None:
+            min_count, max_count = self.obstacle_count_range
+            if min_count < 0 or max_count < min_count:
+                raise ValueError(
+                    "obstacle_count_range must be ordered non-negative integers."
+                )
+            if max_count > self.obstacle_positions.shape[0]:
+                raise ValueError(
+                    "obstacle_count_range cannot exceed the number of obstacle slots."
+                )
+            self.obstacle_count_range = (int(min_count), int(max_count))
+        clearance_values = (
+            self.layout_min_target_spawn_distance,
+            self.layout_min_obstacle_spawn_distance,
+            self.layout_min_obstacle_target_distance,
+            self.layout_min_obstacle_obstacle_distance,
+        )
+        if any(distance < 0 for distance in clearance_values):
+            raise ValueError("layout clearance distances must be non-negative.")
+        if self.layout_sampling_attempts <= 0:
+            raise ValueError("layout_sampling_attempts must be positive.")
         if self.warmup_seconds < 0:
             raise ValueError("warmup_seconds must be non-negative.")
 
@@ -137,6 +172,19 @@ class NavigationTaskFactory:
 
     def __call__(self) -> "OdorObstacleNavigationTask":
         return OdorObstacleNavigationTask(deepcopy(self.config))
+
+
+@dataclass(frozen=True, slots=True)
+class NavigationLayout:
+    spawn_position: np.ndarray
+    spawn_yaw: float
+    odor_source: np.ndarray
+    obstacle_positions: np.ndarray
+    active_obstacle_count: int
+
+    @property
+    def active_obstacle_positions(self) -> np.ndarray:
+        return self.obstacle_positions[: self.active_obstacle_count]
 
 
 class OdorObstacleNavigationTask(gym.Env):
@@ -181,10 +229,14 @@ class OdorObstacleNavigationTask(gym.Env):
         self._base_obstacle_positions = self.config.obstacle_positions.copy()
         self.current_odor_source = self._base_odor_source.copy()
         self.current_obstacle_positions = self._base_obstacle_positions.copy()
+        self.current_active_obstacle_count = self._base_obstacle_positions.shape[0]
         self._rng = np.random.default_rng()
         self._decision_count = 0
         self._prev_distance_to_target: float | None = None
         self._prev_object_size = 0.0
+        self._prev_fly_xy: np.ndarray | None = None
+        self._prev_heading: float | None = None
+        self._prev_policy_action_idx: int | None = None
 
         self.fly = self._make_fly()
         self.world = self._make_world()
@@ -239,18 +291,17 @@ class OdorObstacleNavigationTask(gym.Env):
         super().reset(seed=seed)
         if seed is not None:
             self._rng = np.random.default_rng(seed)
-        spawn_position, spawn_yaw, odor_source, obstacle_positions = (
-            self._sample_layout()
-        )
+        layout = self._sample_layout()
         self.sim.reset()
         self.sim.mj_model.opt.timestep = self.config.timestep
         self.controller.reset(seed=seed)
         self.set_layout(
-            odor_source=odor_source,
-            obstacle_positions=obstacle_positions,
+            odor_source=layout.odor_source,
+            obstacle_positions=layout.obstacle_positions,
+            active_obstacle_count=layout.active_obstacle_count,
             forward=False,
         )
-        self._set_root_state(spawn_position, spawn_yaw)
+        self._set_root_state(layout.spawn_position, layout.spawn_yaw)
         if self.config.warmup_seconds > 0:
             self.sim.warmup(self.config.warmup_seconds)
         mj.mj_forward(self.sim.mj_model, self.sim.mj_data)
@@ -259,18 +310,30 @@ class OdorObstacleNavigationTask(gym.Env):
         self._prev_object_size = 0.0
         fly_position = self._fly_position()
         self._prev_distance_to_target = self._distance_to_target(fly_position)
+        self._prev_fly_xy = np.asarray(fly_position[:2], dtype=np.float32).copy()
+        self._prev_heading = self._fly_heading()
+        self._prev_policy_action_idx = None
         observation, features = self._make_observation()
         info = self._make_info(
             features,
             reward_terms={"progress": 0.0, "success": 0.0, "total": 0.0},
             terminated=False,
             truncated=False,
+            forward_speed=0.0,
+            yaw_rate=0.0,
+            policy_action_idx=None,
+            policy_action_label="",
+            switched_action=False,
         )
         return observation, info
 
     def step(
         self, action: np.ndarray
     ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+        policy_action_idx, policy_action_label = navigation_policy_action_from_raw(
+            action,
+            action_space=self.action_space_name,
+        )
         descending_signal = resolve_navigation_action(
             action,
             action_space=self.action_space_name,
@@ -296,12 +359,42 @@ class OdorObstacleNavigationTask(gym.Env):
         truncated = bool(
             not terminated and self._decision_count >= self.config.max_decision_steps
         )
+        current_fly_xy = np.asarray(fly_position[:2], dtype=np.float32)
+        current_heading = self._fly_heading()
+        forward_speed, yaw_rate = compute_motion_diagnostics(
+            self._prev_fly_xy,
+            self._prev_heading,
+            current_fly_xy,
+            current_heading,
+            self.config.decision_interval,
+        )
+        switched_action = (
+            policy_action_idx is not None
+            and self._prev_policy_action_idx is not None
+            and policy_action_idx != self._prev_policy_action_idx
+        )
+        self._prev_fly_xy = current_fly_xy.copy()
+        self._prev_heading = current_heading
+        self._prev_policy_action_idx = policy_action_idx
         observation, features = self._make_observation()
+        low_level_action = None
+        if self.action_space_name == "continuous":
+            low_level_action = {
+                "left_force": float(descending_signal[0]),
+                "right_force": float(descending_signal[1]),
+                "groom": False,
+            }
         info = self._make_info(
             features,
             reward_terms=reward_terms,
             terminated=terminated,
             truncated=truncated,
+            forward_speed=forward_speed,
+            yaw_rate=yaw_rate,
+            policy_action_idx=policy_action_idx,
+            policy_action_label=policy_action_label,
+            switched_action=switched_action,
+            low_level_action=low_level_action,
         )
         return observation, reward, terminated, truncated, info
 
@@ -310,6 +403,7 @@ class OdorObstacleNavigationTask(gym.Env):
         *,
         odor_source: np.ndarray | None = None,
         obstacle_positions: np.ndarray | None = None,
+        active_obstacle_count: int | None = None,
         forward: bool = True,
     ) -> None:
         if odor_source is not None:
@@ -337,6 +431,16 @@ class OdorObstacleNavigationTask(gym.Env):
                     body_id,
                     np.array([xy[0], xy[1], z_pos], dtype=float),
                 )
+            if active_obstacle_count is None:
+                active_obstacle_count = obstacle_positions.shape[0]
+        if active_obstacle_count is not None:
+            active_obstacle_count = int(active_obstacle_count)
+            if not 0 <= active_obstacle_count <= self.current_obstacle_positions.shape[0]:
+                raise ValueError(
+                    "active_obstacle_count must be between 0 and the number of "
+                    "configured obstacle slots."
+                )
+            self.current_active_obstacle_count = active_obstacle_count
         if forward:
             mj.mj_forward(self.sim.mj_model, self.sim.mj_data)
 
@@ -387,38 +491,15 @@ class OdorObstacleNavigationTask(gym.Env):
             fovy=45.0,
         )
 
-    def _sample_layout(self) -> tuple[np.ndarray, float, np.ndarray, np.ndarray]:
-        spawn_position = self._base_spawn_position.copy()
-        spawn_yaw = self._base_spawn_yaw
-        odor_source = self._base_odor_source.copy()
-        obstacle_positions = self._base_obstacle_positions.copy()
-
-        if not self.config.randomize_layout:
-            return spawn_position, spawn_yaw, odor_source, obstacle_positions
-
-        spawn_position[:2] += self._rng.uniform(
-            -self.config.spawn_xy_jitter,
-            self.config.spawn_xy_jitter,
-            size=2,
+    def _sample_layout(self) -> NavigationLayout:
+        return _sample_navigation_layout(
+            self.config,
+            self._rng,
+            base_spawn_position=self._base_spawn_position,
+            base_spawn_yaw=self._base_spawn_yaw,
+            base_odor_source=self._base_odor_source,
+            base_obstacle_positions=self._base_obstacle_positions,
         )
-        spawn_yaw += float(
-            self._rng.uniform(
-                -self.config.spawn_yaw_jitter,
-                self.config.spawn_yaw_jitter,
-            )
-        )
-        odor_source[0, 0] = self._rng.uniform(*self.config.odor_source_x_range)
-        odor_source[0, 1] = self._rng.uniform(*self.config.odor_source_y_range)
-        if obstacle_positions.size:
-            obstacle_positions[:, 0] = self._rng.uniform(
-                *self.config.obstacle_x_range,
-                size=obstacle_positions.shape[0],
-            )
-            obstacle_positions[:, 1] = self._rng.uniform(
-                *self.config.obstacle_y_range,
-                size=obstacle_positions.shape[0],
-            )
-        return spawn_position, spawn_yaw, odor_source, obstacle_positions
 
     def _make_observation(self) -> tuple[np.ndarray, dict[str, Any]]:
         odor_features = (
@@ -434,8 +515,9 @@ class OdorObstacleNavigationTask(gym.Env):
             if self.config.enable_vision
             else _empty_vision_features()
         )
-        com_per_eye = np.nan_to_num(vision_features["com_per_eye"], nan=0.0)
-        size_per_eye = vision_features["size_per_eye"]
+        odor_features = _finite_float32(odor_features)
+        com_per_eye = _finite_float32(vision_features["com_per_eye"])
+        size_per_eye = _finite_float32(vision_features["size_per_eye"])
         observation = np.array(
             [
                 odor_features[0],
@@ -449,6 +531,7 @@ class OdorObstacleNavigationTask(gym.Env):
             ],
             dtype=np.float32,
         )
+        observation = _finite_float32(observation)
         features = {
             "odor_left": float(odor_features[0]),
             "odor_right": float(odor_features[1]),
@@ -460,6 +543,7 @@ class OdorObstacleNavigationTask(gym.Env):
         if self._retina is None or self._ommatidia_coms is None:
             return _empty_vision_features()
 
+        vision_input = _finite_float32(vision_input)
         vision_features = np.zeros((2, 3), dtype=np.float32)
         for eye_idx, ommatidia_readings in enumerate(vision_input):
             object_mask = ommatidia_readings.max(axis=1) < self.config.object_threshold
@@ -527,21 +611,47 @@ class OdorObstacleNavigationTask(gym.Env):
         reward_terms: dict[str, float],
         terminated: bool,
         truncated: bool,
+        forward_speed: float = 0.0,
+        yaw_rate: float = 0.0,
+        policy_action_idx: int | None = None,
+        policy_action_label: str = "",
+        switched_action: bool = False,
+        low_level_action: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         fly_position = self._fly_position()
-        return {
+        info = {
             "sim_time": float(self.sim.time),
             "decision_count": self._decision_count,
             "fly_position": fly_position.copy(),
             "target_position": self.target_position,
             "obstacle_positions": self.current_obstacle_positions.copy(),
+            "active_obstacle_count": int(self.current_active_obstacle_count),
+            "active_obstacle_positions": self.current_obstacle_positions[
+                : self.current_active_obstacle_count
+            ].copy(),
             "distance_to_target": self._distance_to_target(fly_position),
             "processed_features": features,
             "reward_terms": reward_terms,
             "success": terminated,
+            "is_success": terminated,
             "terminated": terminated,
             "truncated": truncated,
+            "forward_speed": float(forward_speed),
+            "yaw_rate": float(yaw_rate),
+            "policy_action": policy_action_idx,
+            "policy_action_label": policy_action_label,
+            "switched_action": bool(switched_action),
+            "failure_reason": None,
         }
+        if low_level_action is not None:
+            info["low_level_action"] = low_level_action
+        return info
+
+    def _fly_heading(self) -> float:
+        quat = self.sim.mj_data.qpos[
+            self._root_qposadr + 3 : self._root_qposadr + 7
+        ]
+        return _heading_from_quat_wxyz(quat)
 
     def _compute_reward(
         self, distance_to_target: float, success: bool
@@ -606,9 +716,204 @@ class OdorObstacleNavigationTask(gym.Env):
         self.sim.mj_data.mocap_pos[mocap_id] = np.asarray(position, dtype=float)
 
 
+def _sample_navigation_layout(
+    config: NavigationTaskConfig,
+    rng: np.random.Generator,
+    *,
+    base_spawn_position: np.ndarray | None = None,
+    base_spawn_yaw: float | None = None,
+    base_odor_source: np.ndarray | None = None,
+    base_obstacle_positions: np.ndarray | None = None,
+) -> NavigationLayout:
+    spawn_base = (
+        config.spawn_position
+        if base_spawn_position is None
+        else np.asarray(base_spawn_position, dtype=float)
+    )
+    spawn_yaw_base = config.spawn_yaw if base_spawn_yaw is None else base_spawn_yaw
+    odor_base = (
+        config.odor_source
+        if base_odor_source is None
+        else np.asarray(base_odor_source, dtype=float)
+    )
+    obstacle_base = (
+        config.obstacle_positions
+        if base_obstacle_positions is None
+        else np.asarray(base_obstacle_positions, dtype=float)
+    )
+
+    if not config.randomize_layout:
+        obstacle_positions = obstacle_base.copy()
+        return NavigationLayout(
+            spawn_position=spawn_base.copy(),
+            spawn_yaw=float(spawn_yaw_base),
+            odor_source=odor_base.copy(),
+            obstacle_positions=obstacle_positions,
+            active_obstacle_count=obstacle_positions.shape[0],
+        )
+
+    for _attempt in range(config.layout_sampling_attempts):
+        spawn_position = spawn_base.copy()
+        spawn_yaw = float(spawn_yaw_base)
+        odor_source = odor_base.copy()
+        obstacle_positions = obstacle_base.copy()
+
+        spawn_position[:2] += rng.uniform(
+            -config.spawn_xy_jitter,
+            config.spawn_xy_jitter,
+            size=2,
+        )
+        spawn_yaw += float(
+            rng.uniform(
+                -config.spawn_yaw_jitter,
+                config.spawn_yaw_jitter,
+            )
+        )
+        odor_source[0, 0] = rng.uniform(*config.odor_source_x_range)
+        odor_source[0, 1] = rng.uniform(*config.odor_source_y_range)
+
+        active_obstacle_count = obstacle_positions.shape[0]
+        if config.obstacle_count_range is not None:
+            min_count, max_count = config.obstacle_count_range
+            active_obstacle_count = int(rng.integers(min_count, max_count + 1))
+            obstacle_positions[:] = config.inactive_obstacle_position
+
+        if active_obstacle_count:
+            obstacle_positions[:active_obstacle_count, 0] = rng.uniform(
+                *config.obstacle_x_range,
+                size=active_obstacle_count,
+            )
+            obstacle_positions[:active_obstacle_count, 1] = rng.uniform(
+                *config.obstacle_y_range,
+                size=active_obstacle_count,
+            )
+
+        layout = NavigationLayout(
+            spawn_position=spawn_position,
+            spawn_yaw=spawn_yaw,
+            odor_source=odor_source,
+            obstacle_positions=obstacle_positions,
+            active_obstacle_count=active_obstacle_count,
+        )
+        if _navigation_layout_is_valid(config, layout):
+            return layout
+
+    raise RuntimeError(
+        "Failed to sample a valid navigation layout after "
+        f"{config.layout_sampling_attempts} attempts. "
+        "Relax the layout clearance constraints or widen the sampling ranges."
+    )
+
+
+def _navigation_layout_is_valid(
+    config: NavigationTaskConfig,
+    layout: NavigationLayout,
+) -> bool:
+    spawn_xy = layout.spawn_position[:2]
+    target_xy = layout.odor_source[0, :2]
+    active_obstacles = layout.active_obstacle_positions
+
+    if (
+        np.linalg.norm(target_xy - spawn_xy)
+        < config.layout_min_target_spawn_distance
+    ):
+        return False
+
+    if active_obstacles.size == 0:
+        return True
+
+    if config.layout_min_obstacle_spawn_distance > 0:
+        distances = np.linalg.norm(active_obstacles - spawn_xy, axis=1)
+        if np.any(distances < config.layout_min_obstacle_spawn_distance):
+            return False
+
+    if config.layout_min_obstacle_target_distance > 0:
+        distances = np.linalg.norm(active_obstacles - target_xy, axis=1)
+        if np.any(distances < config.layout_min_obstacle_target_distance):
+            return False
+
+    if (
+        config.layout_min_obstacle_obstacle_distance > 0
+        and active_obstacles.shape[0] > 1
+    ):
+        for obstacle_idx in range(active_obstacles.shape[0] - 1):
+            distances = np.linalg.norm(
+                active_obstacles[obstacle_idx + 1 :] - active_obstacles[obstacle_idx],
+                axis=1,
+            )
+            if np.any(distances < config.layout_min_obstacle_obstacle_distance):
+                return False
+
+    return True
+
+
 def _yaw_to_quat_wxyz(yaw: float) -> tuple[float, float, float, float]:
     half_yaw = yaw / 2
     return (math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw))
+
+
+def _wrap_angle(angle: float) -> float:
+    return (angle + math.pi) % (2 * math.pi) - math.pi
+
+
+def _heading_from_quat_wxyz(quat: np.ndarray) -> float:
+    w, x, y, z = np.asarray(quat, dtype=float)
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return float(math.atan2(siny_cosp, cosy_cosp))
+
+
+def navigation_policy_action_from_raw(
+    action: Any,
+    *,
+    action_space: str,
+) -> tuple[int | None, str]:
+    if action_space == "continuous":
+        return None, "low_level"
+    action_array = np.asarray(action)
+    if action_array.shape == (1,):
+        action_value = action_array[0]
+    elif action_array.shape == ():
+        action_value = action_array.item()
+    else:
+        return None, ""
+    action_idx = int(action_value)
+    if action_idx < 0 or action_idx >= len(ACTION_PRESET_NAMES):
+        return action_idx, ""
+    return action_idx, ACTION_PRESET_NAMES[action_idx]
+
+
+def compute_motion_diagnostics(
+    prev_fly_xy: np.ndarray | None,
+    prev_heading: float | None,
+    current_fly_xy: np.ndarray,
+    current_heading: float,
+    decision_interval: float,
+) -> tuple[float, float]:
+    decision_dt = max(float(decision_interval), np.finfo(np.float32).eps)
+    if prev_fly_xy is None or prev_heading is None:
+        return 0.0, 0.0
+    delta_xy = current_fly_xy - prev_fly_xy
+    previous_forward = np.array(
+        [math.cos(prev_heading), math.sin(prev_heading)],
+        dtype=np.float32,
+    )
+    forward_speed = float(np.dot(delta_xy, previous_forward) / decision_dt)
+    yaw_rate = float(_wrap_angle(current_heading - prev_heading) / decision_dt)
+    return forward_speed, yaw_rate
+
+
+def _finite_float32(value: Any) -> np.ndarray:
+    value = np.asarray(value, dtype=np.float32)
+    if np.all(np.isfinite(value)):
+        return value
+    return np.nan_to_num(
+        value,
+        copy=True,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ).astype(np.float32, copy=False)
 
 
 def resolve_navigation_action(
@@ -671,18 +976,49 @@ def _compute_ommatidia_coms(retina: Retina) -> np.ndarray:
     return coms
 
 
+def _odor_intensity_from_sources(
+    sensor_positions: np.ndarray,
+    odor_source: np.ndarray,
+    peak_odor_intensity: np.ndarray,
+) -> np.ndarray:
+    sensor_positions = np.asarray(sensor_positions, dtype=float)
+    odor_source = np.asarray(odor_source, dtype=float)
+    peak_odor_intensity = np.asarray(peak_odor_intensity, dtype=float)
+    n_sensors = sensor_positions.shape[0]
+    odor_sources = np.repeat(
+        np.repeat(
+            odor_source[:, np.newaxis, np.newaxis, :],
+            peak_odor_intensity.shape[1],
+            axis=1,
+        ),
+        n_sensors,
+        axis=2,
+    )
+    peak_intensity = np.repeat(
+        peak_odor_intensity[:, :, np.newaxis],
+        n_sensors,
+        axis=2,
+    )
+    sensor_positions = sensor_positions[np.newaxis, np.newaxis, :, :]
+    distance = np.linalg.norm(sensor_positions - odor_sources, axis=3)
+    return (peak_intensity * distance**-2).sum(axis=0)
+
+
 def _odor_by_side(
     odor_intensity: np.ndarray,
     palps_antennae_weights: tuple[float, float],
 ) -> np.ndarray:
-    odor_intensity = np.asarray(odor_intensity, dtype=np.float32)
+    odor_intensity = _finite_float32(odor_intensity)
     if odor_intensity.size == 0:
         return np.zeros(2, dtype=np.float32)
     odor_by_sensor = odor_intensity.reshape((-1, 2, 2))
+    weights = _finite_float32(palps_antennae_weights)
+    if weights.shape != (2,) or float(weights.sum()) <= 0.0:
+        weights = np.ones(2, dtype=np.float32)
     weighted = np.average(
         odor_by_sensor,
         axis=1,
-        weights=np.asarray(palps_antennae_weights, dtype=np.float32),
+        weights=weights,
     )
     return weighted.sum(axis=0).astype(np.float32)
 

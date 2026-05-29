@@ -3,7 +3,8 @@ demo_output/
 gpu_benchmark_results*/
 debug_outputs/
 .idea/
-
+local_data/
+.outputs/
 # Created by https://www.toptal.com/developers/gitignore/api/vim,emacs,macos,linux,windows,visualstudiocode,git,python,jupyternotebooks
 # Edit at https://www.toptal.com/developers/gitignore?templates=vim,emacs,macos,linux,windows,visualstudiocode,git,python,jupyternotebooks
 
