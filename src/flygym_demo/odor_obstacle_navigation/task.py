@@ -904,11 +904,17 @@ def compute_motion_diagnostics(
 
 
 def _finite_float32(value: Any) -> np.ndarray:
-    value = np.asarray(value, dtype=np.float32)
-    if np.all(np.isfinite(value)):
-        return value
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    elif hasattr(value, "numpy") and callable(value.numpy):
+        value = value.numpy()
+    arr = np.asarray(value)
+    if arr.dtype != np.float32:
+        arr = arr.astype(np.float32, copy=False)
+    if np.all(np.isfinite(arr)):
+        return arr
     return np.nan_to_num(
-        value,
+        arr,
         copy=True,
         nan=0.0,
         posinf=0.0,

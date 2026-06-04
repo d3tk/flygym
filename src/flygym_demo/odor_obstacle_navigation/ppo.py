@@ -12,15 +12,21 @@ from flygym_demo.odor_obstacle_navigation.runners import make_task_runner
 
 
 def _finite_float32_array(values: Any) -> np.ndarray:
-    array = np.asarray(values, dtype=np.float32).copy()
+    if hasattr(values, "detach"):
+        values = values.detach().cpu().numpy()
+    elif hasattr(values, "numpy") and callable(values.numpy):
+        values = values.numpy()
+    array = np.asarray(values)
+    if array.dtype != np.float32:
+        array = array.astype(np.float32, copy=False)
     if not np.all(np.isfinite(array)):
-        np.nan_to_num(
+        array = np.nan_to_num(
             array,
-            copy=False,
+            copy=True,
             nan=0.0,
             posinf=0.0,
             neginf=0.0,
-        )
+        ).astype(np.float32, copy=False)
     return array
 
 
