@@ -108,6 +108,23 @@ def test_task_reset_returns_flat_observation():
         task.close()
 
 
+def test_render_task_colorizes_fly_and_adds_navigation_cameras():
+    task = OdorObstacleNavigationTask(
+        _fast_config(render=True, camera_res=(32, 32), output_fps=10)
+    )
+    try:
+        assert task.renderer is not None
+        assert task.camera.name == "navigation_birdeye"
+        assert [camera.name for camera in task.cameras] == [
+            "navigation_birdeye",
+            "navigation_follow",
+        ]
+        assert task.fly.mjcf_root.asset.find("material", "headthorax") is not None
+        assert any(geom.material is not None for geom in task.fly.mjcf_root.find_all("geom"))
+    finally:
+        task.close()
+
+
 def test_task_passes_sb3_env_check():
     from stable_baselines3.common.env_checker import check_env
 

@@ -32,6 +32,12 @@ ACTION_PRESETS = {
 }
 ACTION_PRESET_NAMES = tuple(ACTION_PRESETS)
 ACTION_PRESET_VALUES = np.stack(tuple(ACTION_PRESETS.values())).astype(np.float32)
+FOLLOW_CAMERA_OFFSET = np.array((0.0, -7.5, 6.0), dtype=float)
+
+
+def _follow_video_path(path: Path) -> Path:
+    suffix = path.suffix or ".mp4"
+    return path.with_name(f"{path.stem}_follow{suffix}")
 
 
 @dataclass(slots=True)
@@ -247,12 +253,19 @@ class OdorObstacleNavigationTask(gym.Env):
             bodysegs_with_ground_contact=ContactBodiesPreset.TIBIA_TARSUS_ONLY,
             add_ground_contact_sensors=False,
         )
-        self.camera = self._add_camera() if self.config.render else None
+        self.camera = self._add_birdeye_camera() if self.config.render else None
+        self.follow_camera = self._add_follow_camera() if self.config.render else None
+        self.cameras = [
+            camera
+            for camera in (self.camera, self.follow_camera)
+            if camera is not None
+        ]
         self.sim = Simulation(self.world)
         self.sim.mj_model.opt.timestep = self.config.timestep
-        if self.camera is not None:
+        self._follow_camera_id = self._camera_id(self.follow_camera)
+        if self.cameras:
             self.renderer = self.sim.set_renderer(
-                [self.camera],
+                self.cameras,
                 camera_res=self.config.camera_res,
                 playback_speed=self.config.playback_speed,
                 output_fps=self.config.output_fps,
@@ -348,6 +361,8 @@ class OdorObstacleNavigationTask(gym.Env):
             )
             apply_locomotion_action(self.sim, self.fly.name, locomotion_action)
             self.sim.step()
+            if self.renderer is not None:
+                self._render_as_needed()
 
         self._decision_count += 1
         fly_position = self._fly_position()
@@ -447,20 +462,29 @@ class OdorObstacleNavigationTask(gym.Env):
     def render(self) -> list[np.ndarray | None]:
         if self.renderer is None:
             return [None]
-        if not self.sim.render_as_needed():
+        if not self._render_as_needed():
             return [None for _ in self.renderer.frames]
         return [frames[-1] for frames in self.renderer.frames.values()]
 
     def save_video(self, path: str | Path) -> None:
         if self.renderer is None:
             raise RuntimeError("render=True is required to save video.")
-        self.renderer.save_video(path)
+        output_path = Path(path)
+        if self.follow_camera is None:
+            self.renderer.save_video(output_path)
+            return
+        self.renderer.save_video(
+            {
+                self.camera: output_path,
+                self.follow_camera: _follow_video_path(output_path),
+            }
+        )
 
     def close(self) -> None:
         self.sim.close()
 
     def _make_fly(self):
-        fly = make_locomotion_fly()
+        fly = make_locomotion_fly(colorize=self.config.render)
         if self.config.enable_vision:
             fly.add_vision()
         if self.config.enable_olfaction:
@@ -477,7 +501,7 @@ class OdorObstacleNavigationTask(gym.Env):
             obstacle_colors=self.config.obstacle_colors,
         )
 
-    def _add_camera(self):
+    def _add_birdeye_camera(self):
         x_extent = max(float(self.config.odor_source[:, 0].max()), 10.0)
         if self.config.obstacle_positions.size:
             x_extent = max(x_extent, float(self.config.obstacle_positions[:, 0].max()))
@@ -489,6 +513,36 @@ class OdorObstacleNavigationTask(gym.Env):
             pos=(max(8.0, x_extent / 2), 0.0, camera_height),
             euler=(0.0, 0.0, 0.0),
             fovy=45.0,
+        )
+
+    def _add_follow_camera(self):
+        return self.world.mjcf_root.worldbody.add(
+            "camera",
+            name="navigation_follow",
+            mode="fixed",
+            pos=tuple(FOLLOW_CAMERA_OFFSET),
+            fovy=30.0,
+            **Rotation3D("xyaxes", (1, 0, 0, 0, 0.6, 0.8)).as_kwargs(),
+        )
+
+    def _camera_id(self, camera) -> int | None:
+        if camera is None:
+            return None
+        return mj.mj_name2id(
+            self.sim.mj_model,
+            mj.mjtObj.mjOBJ_CAMERA,
+            camera.full_identifier,
+        )
+
+    def _render_as_needed(self) -> bool:
+        self._update_follow_camera()
+        return self.sim.render_as_needed()
+
+    def _update_follow_camera(self) -> None:
+        if self._follow_camera_id is None:
+            return
+        self.sim.mj_model.cam_pos[self._follow_camera_id] = (
+            self._fly_position().astype(float) + FOLLOW_CAMERA_OFFSET
         )
 
     def _sample_layout(self) -> NavigationLayout:
