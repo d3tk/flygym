@@ -22,7 +22,7 @@ _VIEWER_ASSETS_DIR = _WASM_DIR / "viewer" / "assets"
 _GAME_ASSETS_DIR = _WASM_DIR / "game" / "assets"
 _GAME_BUILD_SCRIPT = _REPO / "scripts" / "dev" / "build_wasm_game_assets.py"
 
-_MUJOCO_VERSION = "3.9.0"
+_MUJOCO_VERSION = "4.0.1"
 _THREE_VERSION = "0.169.0"
 
 
@@ -49,9 +49,13 @@ def on_serve(server, config, builder, **kwargs):
 
 
 def _ensure_vendor():
-    if (_VENDOR_DIR / "mujoco" / "mujoco.wasm").exists() and (
-        _VENDOR_DIR / "three" / "three.module.js"
-    ).exists():
+    version_file = _VENDOR_DIR / "mujoco" / "VERSION.txt"
+    if (
+        (_VENDOR_DIR / "mujoco" / "mujoco.wasm").exists()
+        and (_VENDOR_DIR / "three" / "three.module.js").exists()
+        and version_file.exists()
+        and version_file.read_text().strip() == _MUJOCO_VERSION
+    ):
         return
 
     print("properdocs: downloading WASM viewer vendor files...")
@@ -74,6 +78,7 @@ def _ensure_vendor():
             },
         )
         (three_dir / "VERSION.txt").write_text(f"three@{_THREE_VERSION}\n")
+        version_file.write_text(f"{_MUJOCO_VERSION}\n")
     except Exception as exc:
         raise SystemExit(
             f"properdocs: failed to download vendor files: {exc}\n"

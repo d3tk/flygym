@@ -30,7 +30,7 @@ wasm/
 `wasm/` lives at the repo root, *outside* MkDocs' `docs/` dir. The MkDocs hook
 [`scripts/dev/properdocs_hooks.py`](../scripts/dev/properdocs_hooks.py):
 
-1. **Downloads `shared/vendor/`** on first build/serve (`@mujoco/mujoco@3.9.0` +
+1. **Downloads `shared/vendor/`** on first build/serve (`@mujoco/mujoco@4.0.1` +
    `three@0.169.0` from npm) — heavy binaries kept out of git.
 2. **Builds the `assets/`** for each app if missing
    (`scripts/dev/build_wasm_viewer_assets.py`,

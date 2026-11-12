@@ -38,4 +38,14 @@ This package is developed at the [Neuroengineering Laboratory](https://www.epfl.
 
 For installation, see [the documentation page](https://neuromechfly.org/installation).
 
+This fork targets MuJoCo 4.0.1 and MuJoCo-Warp 4.0.1. For development, install
+with `uv sync --extra dev --extra examples --extra rl --extra warp`.
+The lockfile also selects Warp 1.19.0; CUDA acceleration requires an NVIDIA GPU.
+
+MuJoCo 4 splits its Python distribution into several packages. When upgrading
+an existing pip environment, uninstall the old MuJoCo package first, then
+reinstall FlyGym (for example, `python -m pip uninstall -y mujoco` followed by
+`python -m pip install -e '.[dev,examples,rl,warp]'`). See the
+[upstream migration notes](https://github.com/google-deepmind/mujoco/releases/tag/4.0.0).
+
 To get started, follow [tutorials here](https://neuromechfly.org/tutorials).
