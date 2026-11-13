@@ -1,6 +1,7 @@
 * [Home](index.md)
 * [Installation](installation.md)
 * [FlyGym v1 vs. v2 API](migration.md)
+* [FlyVis checkpoint verification](flyvis_verification.md)
 * [Code Tutorials](tutorials/index.md)
     * 1&#46; Composing models and scenes
         * [1a. Basic model composition](tutorials/1a_basic_model_composition.ipynb)
